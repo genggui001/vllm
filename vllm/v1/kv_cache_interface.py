@@ -50,8 +50,8 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_K8V4 = 6
     TURBOQUANT_4BIT_NC = 7
     TURBOQUANT_K3V4_NC = 8
-    # Static E4M3FN bytes decoded in software by the opt-in SM80 backend.
     TURBOQUANT_3BIT_NC = 9
+    # Static E4M3FN bytes decoded in software by the opt-in SM80 backend.
     SM80_FP8_PER_TENSOR = 10
 
     @property
