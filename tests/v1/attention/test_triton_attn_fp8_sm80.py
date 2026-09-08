@@ -9,9 +9,12 @@ from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn_fp8_sm80 import (
     TritonFp8Sm80AttentionBackend,
+    TritonQkvFp8Sm80AttentionBackend,
 )
+from vllm.v1.attention.ops.fp8_qdq import scaled_fp8_e4m3_qdq
 from vllm.v1.attention.ops.triton_sm80_fp8 import (
     decode_e4m3fn_uint8,
+    scaled_e4m3fn_qdq_inplace,
     sm80_fp8_unified_attention,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
@@ -23,11 +26,18 @@ def test_backend_registration_spec_and_sm80_guard() -> None:
         AttentionBackendEnum.TRITON_ATTN_FP8_SM80.get_class()
         is TritonFp8Sm80AttentionBackend
     )
+    assert (
+        AttentionBackendEnum.TRITON_ATTN_QKV_FP8_SM80.get_class()
+        is TritonQkvFp8Sm80AttentionBackend
+    )
     assert TritonFp8Sm80AttentionBackend.supports_compute_capability(
         DeviceCapability(8, 0)
     )
     assert not TritonFp8Sm80AttentionBackend.supports_compute_capability(
         DeviceCapability(8, 9)
+    )
+    assert TritonQkvFp8Sm80AttentionBackend.supports_compute_capability(
+        DeviceCapability(8, 0)
     )
 
     spec = AttentionSpec(
@@ -52,6 +62,21 @@ def test_software_e4m3fn_decode_matches_torch() -> None:
 
     torch.testing.assert_close(actual[finite], reference[finite], rtol=0, atol=0)
     assert torch.equal(actual.isnan(), reference.isnan())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_inplace_query_qdq_matches_materialized_reference() -> None:
+    torch.manual_seed(1)
+    query = torch.randn(37, 8, 256, dtype=torch.bfloat16, device="cuda")
+    scale = torch.tensor([0.02], dtype=torch.float32, device="cuda")
+    num_tokens = 29
+    expected = query.clone()
+    expected[:num_tokens] = scaled_fp8_e4m3_qdq(expected[:num_tokens], scale)
+
+    actual = query.clone()
+    scaled_e4m3fn_qdq_inplace(actual, scale, num_tokens=num_tokens)
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -152,7 +177,6 @@ def test_sm80_fp8_attention_matches_materialized_bf16_qdq() -> None:
         "window_size": (-1, -1),
         "block_table": block_tables,
         "softcap": 0,
-        "q_descale": None,
         "seq_threshold_3D": 0,
     }
     sm80_fp8_unified_attention(
@@ -160,6 +184,7 @@ def test_sm80_fp8_attention_matches_materialized_bf16_qdq() -> None:
         k=key_bytes,
         v=value_bytes,
         out=output,
+        q_descale=None,
         k_descale=k_descale,
         v_descale=v_descale,
         **common,
@@ -169,6 +194,7 @@ def test_sm80_fp8_attention_matches_materialized_bf16_qdq() -> None:
         k=key_qdq,
         v=value_qdq,
         out=reference,
+        q_descale=None,
         k_descale=None,
         v_descale=None,
         kv_quant_mode=KVQuantMode.NONE,

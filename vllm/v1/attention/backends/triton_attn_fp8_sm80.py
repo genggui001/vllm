@@ -16,8 +16,12 @@ from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
+    TritonAttentionMetadata,
 )
-from vllm.v1.attention.ops.triton_sm80_fp8 import sm80_fp8_unified_attention
+from vllm.v1.attention.ops.triton_sm80_fp8 import (
+    scaled_e4m3fn_qdq_inplace,
+    sm80_fp8_unified_attention,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
 
 logger = init_logger(__name__)
@@ -57,6 +61,7 @@ class TritonFp8Sm80AttentionImpl(TritonAttentionImpl):
     """Store static-scale E4M3FN bytes and decode each paged-attention tile."""
 
     attention_fn = staticmethod(sm80_fp8_unified_attention)
+    quantize_bf16_query: ClassVar[bool] = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -73,8 +78,13 @@ class TritonFp8Sm80AttentionImpl(TritonAttentionImpl):
                 f"{self.kv_cache_dtype}."
             )
         self._kv_quant_mode = KVQuantMode.SM80_FP8_PER_TENSOR
+        query_mode = (
+            "one-pass in-place E4M3FN Q QDQ"
+            if self.quantize_bf16_query
+            else "BF16 query"
+        )
         logger.info_once(
-            "Using SM80 software-decoded E4M3FN uint8 KV cache with BF16 query"
+            "Using SM80 software-decoded E4M3FN uint8 KV cache with %s", query_mode
         )
 
     def do_kv_cache_update(
@@ -105,7 +115,57 @@ class TritonFp8Sm80AttentionImpl(TritonAttentionImpl):
         )
 
 
+class TritonQkvFp8Sm80AttentionBackend(TritonFp8Sm80AttentionBackend):
+    """SM80 uint8 K/V cache plus one-pass static-scale E4M3FN Q QDQ."""
+
+    @staticmethod
+    def get_name() -> str:
+        return "TRITON_ATTN_QKV_FP8_SM80"
+
+    @staticmethod
+    def get_impl_cls() -> type["TritonQkvFp8Sm80AttentionImpl"]:
+        return TritonQkvFp8Sm80AttentionImpl
+
+
+class TritonQkvFp8Sm80AttentionImpl(TritonFp8Sm80AttentionImpl):
+    """Match Q/K/V FP8 QAT while computing attention on SM80 BF16 cores."""
+
+    quantize_bf16_query: ClassVar[bool] = True
+
+    def forward(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if attn_metadata is not None:
+            scaled_e4m3fn_qdq_inplace(
+                query,
+                layer._q_scale,
+                num_tokens=attn_metadata.num_actual_tokens,
+            )
+        return super().forward(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        )
+
+
 __all__ = [
     "TritonFp8Sm80AttentionBackend",
     "TritonFp8Sm80AttentionImpl",
+    "TritonQkvFp8Sm80AttentionBackend",
+    "TritonQkvFp8Sm80AttentionImpl",
 ]

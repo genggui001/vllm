@@ -33,6 +33,74 @@ def e4m3fn_uint8_to_float32(data):
 
 
 @triton.jit
+def scaled_e4m3fn_qdq_float32(values, scale):
+    """Apply static-scale E4M3FN QDQ without FP8 instructions."""
+    normalized = tl.clamp(
+        tl.div_rn(values.to(tl.float32), scale),
+        -448.0,
+        448.0,
+    )
+    magnitude = tl.abs(normalized)
+    normal_magnitude = tl.maximum(magnitude, 0.015625)
+    exponent = tl.floor(tl.log2(normal_magnitude))
+    exponent = tl.maximum(tl.minimum(exponent, 8.0), -6.0)
+    normal_step = tl.exp2(exponent - 3.0)
+    step = tl.where(magnitude < 0.015625, 0.001953125, normal_step)
+    quantized_magnitude = tl.extra.cuda.libdevice.rint(magnitude / step) * step
+    quantized_magnitude = tl.minimum(quantized_magnitude, 448.0)
+    quantized = tl.where(normalized < 0.0, -quantized_magnitude, quantized_magnitude)
+    return quantized * scale
+
+
+@triton.jit
+def _scaled_e4m3fn_qdq_inplace_kernel(
+    tensor_ptr,
+    scale_ptr,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    values = tl.load(tensor_ptr + offsets, mask=mask, other=0.0)
+    qdq = scaled_e4m3fn_qdq_float32(values, tl.load(scale_ptr))
+    tl.store(tensor_ptr + offsets, qdq, mask=mask)
+
+
+def scaled_e4m3fn_qdq_inplace(
+    tensor: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    num_tokens: int | None = None,
+) -> torch.Tensor:
+    """Apply one-pass static-scale E4M3FN QDQ to a temporary BF16 buffer."""
+    if tensor.dtype != torch.bfloat16 or not tensor.is_cuda:
+        raise TypeError("tensor must be a CUDA bfloat16 tensor")
+    if not tensor.is_contiguous():
+        raise ValueError("tensor must be contiguous")
+    if scale.dtype != torch.float32 or scale.numel() != 1:
+        raise ValueError("scale must be a scalar float32 tensor")
+    if scale.device != tensor.device:
+        raise ValueError("scale must be on the same device as tensor")
+    if num_tokens is None:
+        numel = tensor.numel()
+    else:
+        if tensor.ndim < 1 or not 0 <= num_tokens <= tensor.shape[0]:
+            raise ValueError(
+                f"invalid num_tokens={num_tokens} for shape {tensor.shape}"
+            )
+        numel = num_tokens * tensor.stride(0)
+
+    block_size = 256
+    _scaled_e4m3fn_qdq_inplace_kernel[(triton.cdiv(numel, block_size),)](
+        tensor,
+        scale,
+        numel,
+        BLOCK_SIZE=block_size,
+    )
+    return tensor
+
+
+@triton.jit
 def _decode_e4m3fn_kernel(
     src_ptr,
     dst_ptr,
@@ -99,5 +167,7 @@ def sm80_fp8_unified_attention(**kwargs) -> None:
 __all__ = [
     "decode_e4m3fn_uint8",
     "e4m3fn_uint8_to_float32",
+    "scaled_e4m3fn_qdq_float32",
+    "scaled_e4m3fn_qdq_inplace",
     "sm80_fp8_unified_attention",
 ]

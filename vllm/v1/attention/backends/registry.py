@@ -58,6 +58,10 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.triton_attn_fp8_sm80."
         "TritonFp8Sm80AttentionBackend"
     )
+    TRITON_ATTN_QKV_FP8_SM80 = (
+        "vllm.v1.attention.backends.triton_attn_fp8_sm80."
+        "TritonQkvFp8Sm80AttentionBackend"
+    )
     TRITON_ATTN_DIFFKV = (
         "vllm.v1.attention.backends.triton_attn_diffkv.TritonAttentionDiffKVBackend"
     )
