@@ -32,9 +32,9 @@ served_model_name="${SERVED_MODEL_NAME:-pulse-v20-marlin-fp8-qdq}"
 port="${PORT:-18080}"
 moe_backend="${MOE_BACKEND:-marlin_fp8_qdq}"
 case "$moe_backend" in
-    marlin | marlin_fp8_qdq) ;;
+    marlin | marlin_fp8_qdq | marlin_fp8_qdq_fused) ;;
     *)
-        echo "MOE_BACKEND must be marlin or marlin_fp8_qdq" >&2
+        echo "MOE_BACKEND must be marlin, marlin_fp8_qdq, or marlin_fp8_qdq_fused" >&2
         exit 2
         ;;
 esac
