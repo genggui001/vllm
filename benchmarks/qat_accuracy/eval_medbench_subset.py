@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +65,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--max-tokens", type=int, default=32768)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        help=(
+            "Override the selected profile temperature. This is intended for "
+            "deterministic kernel diagnostics; omitted preserves profile behavior."
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--retries", type=int, default=2)
     args = parser.parse_args()
@@ -72,6 +80,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--concurrency must be positive")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
+    if args.temperature is not None and args.temperature < 0:
+        parser.error("--temperature must be non-negative")
     return args
 
 
@@ -319,6 +329,8 @@ def corruption_stats(
 def main() -> None:
     args = parse_args()
     profile = PROFILES[args.profile]
+    if args.temperature is not None:
+        profile = replace(profile, temperature=args.temperature)
     datasets = args.datasets or ["CHIP-CDEE", "CMeEE", "MedSafety"]
     cases = []
     for dataset in datasets:
@@ -372,6 +384,9 @@ def main() -> None:
             "concurrency": args.concurrency,
             "max_tokens": args.max_tokens,
             "seed": args.seed,
+            "temperature": profile.temperature,
+            "top_p": profile.top_p,
+            "top_k": profile.top_k,
         },
         "scores": scores,
         "corruption": corruption_stats(results, args.profile),

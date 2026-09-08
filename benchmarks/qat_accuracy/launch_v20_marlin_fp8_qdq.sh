@@ -38,6 +38,24 @@ case "$moe_backend" in
         exit 2
         ;;
 esac
+attention_backend="${ATTENTION_BACKEND:-FLASH_ATTN}"
+case "$attention_backend" in
+    FLASH_ATTN | FLASH_ATTN_FP8_QDQ_SM80 | FLASH_ATTN_KV_FP8_QDQ_SM80) ;;
+    *)
+        echo "ATTENTION_BACKEND must be FLASH_ATTN, FLASH_ATTN_FP8_QDQ_SM80, or FLASH_ATTN_KV_FP8_QDQ_SM80" >&2
+        exit 2
+        ;;
+esac
+enable_prefix_caching="${ENABLE_PREFIX_CACHING:-true}"
+prefix_cache_args=()
+case "$enable_prefix_caching" in
+    true) ;;
+    false) prefix_cache_args+=(--no-enable-prefix-caching) ;;
+    *)
+        echo "ENABLE_PREFIX_CACHING must be true or false" >&2
+        exit 2
+        ;;
+esac
 
 hf_overrides='{"quantization_config":{"config_groups":{"group_0":{"format":"pack-quantized","input_activations":null,"output_activations":null,"targets":["Linear"],"weights":{"actorder":null,"block_structure":null,"dynamic":false,"group_size":128,"num_bits":4,"observer":"minmax","observer_kwargs":{},"strategy":"group","symmetric":true,"type":"int"}}},"format":"pack-quantized","ignore":["re:.*self_attn.*","re:.*linear_attn.*","re:.*shared_expert.*","re:.*mlp[.](gate|up|gate_up|down)_proj.*","re:.*lm_head.*","re:.*mtp.*","re:.*visual.*"],"kv_cache_scheme":{"actorder":null,"block_structure":null,"dynamic":false,"group_size":null,"num_bits":8,"observer":"minmax","observer_kwargs":{},"scale_dtype":null,"strategy":"tensor","symmetric":true,"type":"float","zp_dtype":null},"quant_method":"compressed-tensors","quantization_status":"compressed"}}'
 
@@ -48,9 +66,10 @@ exec vllm serve "$model_path" \
     --gpu-memory-utilization 0.8 \
     --max-num-seqs 256 \
     --kv-cache-dtype bfloat16 \
-    --attention-backend FLASH_ATTN \
+    --attention-backend "$attention_backend" \
     --moe-backend "$moe_backend" \
     --hf-overrides "$hf_overrides" \
+    "${prefix_cache_args[@]}" \
     --trust-remote-code \
     --host 127.0.0.1 \
     --port "$port"
