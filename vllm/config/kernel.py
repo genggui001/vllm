@@ -131,6 +131,7 @@ MoEBackend = Literal[
     "flashinfer_cutedsl",
     "flashinfer_b12x",
     "marlin",
+    "marlin_fp8_qdq",
     "humming",
     "triton_unfused",
     "aiter",
@@ -205,6 +206,8 @@ class KernelConfig:
     - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
       (RTX Pro 6000 / DGX Spark)
     - "marlin": Use Marlin kernels (weight-only quantization)
+    - "marlin_fp8_qdq": Use Marlin WNA16 kernels with QAT-compatible,
+      dynamic per-token FP8 fake quantization before both expert GEMMs
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
     - "aiter": Use AMD AITer kernels (ROCm only)

@@ -108,6 +108,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         self.is_marlin = self.wna16_backend in [
             WNA16MoEBackend.MARLIN,
+            WNA16MoEBackend.MARLIN_FP8_QDQ,
             WNA16MoEBackend.BATCHED_MARLIN,
         ]
         self.is_transposed = self.wna16_backend != WNA16MoEBackend.FLASHINFER_TRTLLM

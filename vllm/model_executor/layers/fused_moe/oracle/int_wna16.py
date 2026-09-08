@@ -19,6 +19,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.experts.marlin_fp8_qdq_moe import (
+    MarlinFp8QdqExperts,
+)
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     BatchedMarlinExperts,
     MarlinExperts,
@@ -50,6 +53,7 @@ logger = init_logger(__name__)
 
 class WNA16MoEBackend(Enum):
     MARLIN = "MARLIN"
+    MARLIN_FP8_QDQ = "MARLIN_FP8_QDQ"
     BATCHED_MARLIN = "BATCHED_MARLIN"
     HUMMING = "HUMMING"
     CPU = "CPU"
@@ -77,6 +81,8 @@ def backend_to_kernel_cls(
         ]
     elif backend == WNA16MoEBackend.MARLIN:
         return [MarlinExperts]
+    elif backend == WNA16MoEBackend.MARLIN_FP8_QDQ:
+        return [MarlinFp8QdqExperts]
     elif backend == WNA16MoEBackend.BATCHED_MARLIN:
         return [BatchedMarlinExperts]
     elif backend == WNA16MoEBackend.FLASHINFER_TRTLLM:
@@ -157,6 +163,7 @@ def _backend_incompatibility_reason(
 
     if allow_marlin and backend in (
         WNA16MoEBackend.MARLIN,
+        WNA16MoEBackend.MARLIN_FP8_QDQ,
         WNA16MoEBackend.BATCHED_MARLIN,
     ):
         if isinstance(quant_config, (AutoAWQConfig, AutoGPTQConfig, QuantizationArgs)):
@@ -171,6 +178,7 @@ def _backend_incompatibility_reason(
 
     if not allow_marlin and backend in (
         WNA16MoEBackend.MARLIN,
+        WNA16MoEBackend.MARLIN_FP8_QDQ,
         WNA16MoEBackend.BATCHED_MARLIN,
         WNA16MoEBackend.EMULATION,
     ):
@@ -184,6 +192,7 @@ def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
     mapping = {
         "triton": WNA16MoEBackend.TRITON,
         "marlin": WNA16MoEBackend.MARLIN,
+        "marlin_fp8_qdq": WNA16MoEBackend.MARLIN_FP8_QDQ,
         "humming": WNA16MoEBackend.HUMMING,
         "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
         "emulation": WNA16MoEBackend.EMULATION,
@@ -383,6 +392,7 @@ def make_wna16_moe_kernel(
     # grouped/indexed experts, and Int4EmulationTritonExperts
     allowed_experts: tuple[type[mk.FusedMoEExperts], ...] = (
         MarlinExperts,
+        MarlinFp8QdqExperts,
         BatchedMarlinExperts,
         TritonWNA16Experts,
         TrtLlmMxint4ExpertsMonolithic,
@@ -1476,6 +1486,7 @@ def convert_to_wna16_moe_kernel_format(
 
     if backend in (
         WNA16MoEBackend.MARLIN,
+        WNA16MoEBackend.MARLIN_FP8_QDQ,
         WNA16MoEBackend.BATCHED_MARLIN,
     ):
         from vllm.model_executor.layers.quantization.auto_awq import (
