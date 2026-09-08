@@ -95,6 +95,18 @@ temperature 0.7/top-p 0.8/top-k 20; `r` and `enr` used temperature 1.0/top-p
 Range across the three profiles is 3.8217 points on CHIP-CDEE, 2.6675 on
 CMeEE, and 8.0000 on MedSafety.
 
+### Final QKV FP8 profile performance
+
+| Profile | Completion tokens | Elapsed (s) | Requests/s | Output tok/s | Max request (s) |
+|---|---:|---:|---:|---:|---:|
+| base | 30,871 | 27.37 | 16.147 | 1127.7 | 25.60 |
+| r | 676,636 | 405.22 | 1.091 | 1669.8 | 365.83 |
+| enr | 700,130 | 523.27 | 0.845 | 1338.0 | 491.99 |
+
+These end-to-end profile timings include different generated lengths and
+therefore should not be used as a pure kernel-speed comparison. The controlled
+64-request x 256-token benchmark above is the kernel-path comparison.
+
 ### Change from the previous A100 FP8-KV-only candidate
 
 | Profile | CHIP-CDEE | CMeEE | MedSafety |
