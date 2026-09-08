@@ -108,28 +108,52 @@ errors, zero empty responses, zero U+FFFD replacement characters, and zero NUL
 characters. All 884 `r`/`enr` responses contained exactly one `</ggthink>`.
 The earlier repeated/corrupt reasoning-output failure did not reproduce.
 
+### Deterministic Q-only A/B for the non-reasoning profile
+
+To isolate the effect of Q QDQ, two services were run simultaneously with the
+same model, MoE backend, FP8 K/V backend, cache capacity, prompts, seed, and
+sampling parameters. The control used BF16 Q and the experiment used FP8-QDQ
+Q. Both used temperature 0. The only intended numerical difference was Q QDQ.
+
+| Attention path | CHIP-CDEE | CMeEE | MedSafety |
+|---|---:|---:|---:|
+| BF16 Q + FP8 K/V | 47.7272 | 57.6388 | 76.0000 |
+| Q QDQ + FP8 K/V | 49.7165 | 57.5057 | 78.0000 |
+| **Q QDQ delta** | **+1.9893** | **-0.1331** | **+2.0000** |
+
+Both sides produced 442/442 valid responses with no corruption. Exact output
+agreement was 42/100 on CHIP-CDEE, 72/100 on CMeEE, and 234/242 on MedSafety,
+which confirms that Q QDQ materially changes the numerical path rather than
+being optimized away.
+
+A temperature-0 paired run was also attempted for the reasoning profile, but
+30 control requests and 15 QDQ requests entered deterministic loops that were
+still generating toward the 32K-token limit. The diagnostic was stopped and is
+not reported as a score. This behavior occurred on both attention paths;
+temperature 0 is useful for the short non-reasoning A/B, but is not a suitable
+production setting for this model's reasoning profiles.
+
 ## Interpretation and next accuracy experiment
 
 The engineering result is positive: Q QDQ adds only about 0.49% throughput
 cost on top of the real FP8-KV backend, the FP8 cache capacity is retained, and
-long concurrent generation is stable.
+long concurrent generation is stable. The paired temperature-0 `base` result
+also establishes that Q QDQ is an effective non-reasoning accuracy change on
+this A100 setup: two datasets improve by about two points and the third changes
+by only -0.13 point.
 
-This run does **not** establish that A100 accuracy has caught H20. The comparison
-above is against the previous A100 FP8-KV-only candidate, and the scored runs
-use non-zero temperature. The mixed score deltas also do not establish that Q
-QDQ improves aggregate accuracy by itself.
+This run does **not** establish that A100 accuracy has caught H20. The full-run
+comparison above is against the previous A100 FP8-KV-only candidate, and its
+profiles use non-zero temperature. Their mixed score deltas therefore include
+sampling-path divergence after the intended Q perturbation.
 
-The next discriminating test should be a paired run over the same samples with
-temperature 0 for:
-
-1. A100 fused MoE QDQ + FP8 KV only;
-2. A100 fused MoE QDQ + QKV FP8;
-3. H20 CUTLASS W4A8 + QKV FP8 baseline.
-
-Use identical prompts, limits, tokenizer/chat template, checkpoint scales, and
-post-FC2 `router_prob` order. Compare per-sample exact answer agreement and
-score deltas in addition to aggregate dataset scores. This separates numerical
-backend differences from sampling-path divergence.
+The remaining discriminating test is to run the same standalone non-reasoning
+`base` evaluation at temperature 0 on the H20 CUTLASS W4A8 + QKV FP8 baseline
+and compare it with the two saved A100 results above. Use identical prompts,
+limits, tokenizer/chat template, checkpoint scales, and post-FC2 `router_prob`
+order. Compare per-sample exact answer agreement and score deltas in addition
+to aggregate dataset scores. For `r` and `enr`, retain the production
+temperature of 1.0 and use multiple fixed seeds rather than temperature 0.
 
 ## Reproduction
 
