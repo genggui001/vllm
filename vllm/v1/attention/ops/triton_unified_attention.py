@@ -987,6 +987,9 @@ def unified_attention(
         head_size, sliding_window_val, q.element_size(), is_prefill=False
     )
 
+    if kv_quant_mode == KVQuantMode.SM80_FP8_PER_TENSOR:
+        launch_num_warps = 8
+
     # Wider KV tile for the tuned large-head path (see above). Only the 2D
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
