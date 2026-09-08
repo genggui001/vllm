@@ -28,6 +28,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     softmax_step,
     store_segm_reduce_scalars,
 )
+from vllm.v1.attention.ops.triton_sm80_fp8 import e4m3fn_uint8_to_float32
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
@@ -48,6 +49,10 @@ def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
       tensor-wide scale, unless Q is also FP8 and the caller folds the scales
       into the attention score and output accumulator.
     """
+    if KV_QUANT_MODE == 10:
+        return (
+            e4m3fn_uint8_to_float32(data) * tl.load(tensor_scale)
+        ).to(Q.dtype)
     if KV_QUANT_MODE == 1:
         if Q.dtype.is_fp8():
             return data.to(Q.dtype)

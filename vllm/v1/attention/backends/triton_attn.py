@@ -433,6 +433,8 @@ class TritonAttentionBackend(AttentionBackend):
 
 
 class TritonAttentionImpl(AttentionImpl):
+    attention_fn = staticmethod(unified_attention)
+
     # Per-token-head quant: scale views carved from inline head padding.
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
@@ -707,7 +709,7 @@ class TritonAttentionImpl(AttentionImpl):
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
-        unified_attention(
+        self.attention_fn(
             q=query[:num_actual_tokens],
             k=key_cache,
             v=value_cache,
