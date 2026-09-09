@@ -46,12 +46,12 @@ static void check_scale(const Tensor &scale, const Tensor &reference,
                     name, " must be on the same device as q");
 }
 
-std::vector<Tensor> mha_varlen_fwd_sm80_fp8(
+static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
     const Tensor &q, const Tensor &k, const Tensor &v, Tensor out,
     const Tensor &cu_seqlens_q, const Tensor &seqused_k,
     const Tensor &block_table, const Tensor &q_scale, const Tensor &k_scale,
     const Tensor &v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
-    double softmax_scale, bool is_causal) {
+    double softmax_scale, bool is_causal, bool return_softmax_lse) {
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
     const auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     STD_TORCH_CHECK(cc_major == 8 && cc_minor == 0,
@@ -132,11 +132,8 @@ std::vector<Tensor> mha_varlen_fwd_sm80_fp8(
         pack_decode_gqa ? num_heads_k : num_heads;
     const int kernel_seqlen_q =
         pack_decode_gqa ? q_head_groups : max_seqlen_q;
-    const int kernel_total_q =
-        pack_decode_gqa ? batch_size * q_head_groups : total_q;
-
-    auto softmax_lse =
-        torch::stable::new_empty(q, {num_heads, total_q}, ScalarType::Float);
+    auto softmax_lse = torch::stable::new_empty(
+        q, {num_heads, return_softmax_lse ? total_q : 0}, ScalarType::Float);
     Flash_fwd_sm80_fp8_params params{};
     params.q_ptr = q.data_ptr();
     params.k_ptr = k.data_ptr();
@@ -158,7 +155,8 @@ std::vector<Tensor> mha_varlen_fwd_sm80_fp8(
         pack_decode_gqa ? out.stride(1) : out.stride(0);
     params.o_head_stride =
         pack_decode_gqa ? q_head_groups * out.stride(1) : out.stride(1);
-    params.softmax_lse_ptr = softmax_lse.data_ptr();
+    params.softmax_lse_ptr =
+        return_softmax_lse ? softmax_lse.data_ptr() : nullptr;
     params.cu_seqlens_q = pack_decode_gqa
                               ? nullptr
                               : static_cast<int *>(cu_seqlens_q.data_ptr());
@@ -174,7 +172,10 @@ std::vector<Tensor> mha_varlen_fwd_sm80_fp8(
     params.h_h_k_ratio = pack_decode_gqa ? 1 : q_head_groups;
     params.seqlen_q = kernel_seqlen_q;
     params.seqlen_k = max_seqlen_k;
-    params.total_q = kernel_total_q;
+    // total_q remains the physical token count because softmax_lse is exposed
+    // as [num_query_heads, total_q].  The packed-GQA kernel has a larger
+    // logical row count, but stores each row back into that public layout.
+    params.total_q = total_q;
     params.d = head_size;
     params.d_rounded = head_size;
     params.scale_softmax = static_cast<float>(softmax_scale);
@@ -194,9 +195,34 @@ std::vector<Tensor> mha_varlen_fwd_sm80_fp8(
     params.q_scale_ptr = static_cast<const float *>(q_scale.data_ptr());
     params.k_scale_ptr = static_cast<const float *>(k_scale.data_ptr());
     params.v_scale_ptr = static_cast<const float *>(v_scale.data_ptr());
+    params.packed_decode_gqa = pack_decode_gqa;
+    params.return_softmax_lse = return_softmax_lse;
 
     run_mha_fwd_sm80_fp8(params, get_current_cuda_stream_sm80_fp8(q));
-    return {out, softmax_lse};
+    return return_softmax_lse ? std::vector<Tensor>{out, softmax_lse}
+                              : std::vector<Tensor>{out};
+}
+
+std::vector<Tensor> mha_varlen_fwd_sm80_fp8(
+    const Tensor &q, const Tensor &k, const Tensor &v, Tensor out,
+    const Tensor &cu_seqlens_q, const Tensor &seqused_k,
+    const Tensor &block_table, const Tensor &q_scale, const Tensor &k_scale,
+    const Tensor &v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal) {
+    return mha_varlen_fwd_sm80_fp8_impl(
+        q, k, v, out, cu_seqlens_q, seqused_k, block_table, q_scale, k_scale,
+        v_scale, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, false);
+}
+
+std::vector<Tensor> mha_varlen_fwd_sm80_fp8_lse(
+    const Tensor &q, const Tensor &k, const Tensor &v, Tensor out,
+    const Tensor &cu_seqlens_q, const Tensor &seqused_k,
+    const Tensor &block_table, const Tensor &q_scale, const Tensor &k_scale,
+    const Tensor &v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal) {
+    return mha_varlen_fwd_sm80_fp8_impl(
+        q, k, v, out, cu_seqlens_q, seqused_k, block_table, q_scale, k_scale,
+        v_scale, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, true);
 }
 
 }  // namespace FLASH_NAMESPACE

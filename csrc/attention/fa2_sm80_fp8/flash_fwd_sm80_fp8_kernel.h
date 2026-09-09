@@ -207,13 +207,16 @@ inline __device__ void compute_attn_sm80_fp8(
             out[out_base + index_t(linear / kHeadDim) * params.o_row_stride +
                 linear % kHeadDim] = Element(0.0f);
         }
-        if (tidx < valid_rows) {
-            const index_t lse_base =
-                index_t(bidh) * params.total_q +
-                binfo.q_offset(params.seqlen_q, 1, bidb) +
-                m_block * kBlockM;
+        if (params.return_softmax_lse && tidx < valid_rows) {
+            const int logical_row = m_block * kBlockM + tidx;
+            const index_t lse_offset = params.packed_decode_gqa
+                ? index_t(bidh * params.seqlen_q + logical_row) *
+                          params.total_q +
+                      bidb
+                : index_t(bidh) * params.total_q +
+                      binfo.q_offset(params.seqlen_q, 1, bidb) + logical_row;
             reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)
-                [lse_base + tidx] = INFINITY;
+                [lse_offset] = INFINITY;
         }
         return;
     }
@@ -351,17 +354,10 @@ inline __device__ void compute_attn_sm80_fp8(
         binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb) +
         index_t(m_block * kBlockM) * params.o_row_stride +
         index_t(bidh) * params.o_head_stride;
-    const index_t row_offset_lse =
-        index_t(bidh) * params.total_q +
-        binfo.q_offset(params.seqlen_q, 1, bidb) + m_block * kBlockM;
     Tensor gO = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element *>(params.o_ptr) + row_offset_o),
         Shape<Int<kBlockM>, Int<kHeadDim>>{},
         make_stride(params.o_row_stride, _1{}));
-    Tensor gLSE = make_tensor(
-        make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) +
-                      row_offset_lse),
-        Shape<Int<kBlockM>>{}, Stride<_1>{});
     typename KernelTraits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
@@ -375,12 +371,20 @@ inline __device__ void compute_attn_sm80_fp8(
     Tensor taccOcO = thr_mma.partition_C(caccO);
     Tensor taccOcO_row =
         logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
-    if (get<1>(taccOcO_row(0)) == 0) {
+    if (params.return_softmax_lse && get<1>(taccOcO_row(0)) == 0) {
 #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row = get<0>(taccOcO_row(mi));
             if (row < binfo.actual_seqlen_q - m_block * kBlockM) {
-                gLSE(row) = lse(mi);
+                const int logical_row = m_block * kBlockM + row;
+                const index_t lse_offset = params.packed_decode_gqa
+                    ? index_t(bidh * params.seqlen_q + logical_row) *
+                              params.total_q +
+                          bidb
+                    : index_t(bidh) * params.total_q +
+                          binfo.q_offset(params.seqlen_q, 1, bidb) + logical_row;
+                reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)
+                    [lse_offset] = lse(mi);
             }
         }
     }

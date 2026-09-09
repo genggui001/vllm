@@ -56,6 +56,16 @@ case "$enable_prefix_caching" in
         exit 2
         ;;
 esac
+enable_cascade_attention="${ENABLE_CASCADE_ATTENTION:-false}"
+cascade_args=()
+case "$enable_cascade_attention" in
+    true) cascade_args+=(--no-disable-cascade-attn) ;;
+    false) ;;
+    *)
+        echo "ENABLE_CASCADE_ATTENTION must be true or false" >&2
+        exit 2
+        ;;
+esac
 
 hf_overrides='{"quantization_config":{"config_groups":{"group_0":{"format":"pack-quantized","input_activations":null,"output_activations":null,"targets":["Linear"],"weights":{"actorder":null,"block_structure":null,"dynamic":false,"group_size":128,"num_bits":4,"observer":"minmax","observer_kwargs":{},"strategy":"group","symmetric":true,"type":"int"}}},"format":"pack-quantized","ignore":["re:.*self_attn.*","re:.*linear_attn.*","re:.*shared_expert.*","re:.*mlp[.](gate|up|gate_up|down)_proj.*","re:.*lm_head.*","re:.*mtp.*","re:.*visual.*"],"kv_cache_scheme":{"actorder":null,"block_structure":null,"dynamic":false,"group_size":null,"num_bits":8,"observer":"minmax","observer_kwargs":{},"scale_dtype":null,"strategy":"tensor","symmetric":true,"type":"float","zp_dtype":null},"quant_method":"compressed-tensors","quantization_status":"compressed"}}'
 
@@ -70,6 +80,7 @@ exec vllm serve "$model_path" \
     --moe-backend "$moe_backend" \
     --hf-overrides "$hf_overrides" \
     "${prefix_cache_args[@]}" \
+    "${cascade_args[@]}" \
     --trust-remote-code \
     --host 127.0.0.1 \
     --port "$port"

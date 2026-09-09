@@ -21,6 +21,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
 
 try:
@@ -38,10 +39,7 @@ logger = init_logger(__name__)
 class FlashAttentionQkvFp8Sm80FusedMetadataBuilder(
     FlashAttentionMetadataBuilder
 ):
-    """Use ordinary paged FA2 in v1; cascade support is a v2 deliverable."""
-
-    def use_cascade_attention(self, *args, **kwargs) -> bool:
-        return False
+    """Use the stock FA2 cascade heuristic and metadata representation."""
 
 
 class FlashAttentionQkvFp8Sm80FusedBackend(FlashAttentionBackend):
@@ -144,7 +142,7 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
 
         logger.info_once(
             "Using independent FA2-derived SM80 fused Q QDQ + uint8 E4M3FN "
-            "paged K/V decode (static per-layer scales; cascade disabled in v1)"
+            "paged K/V decode (static per-layer scales; cascade supported)"
         )
 
     def do_kv_cache_update(
@@ -187,11 +185,6 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
             raise NotImplementedError("Fused output quantization is not supported.")
         if attn_metadata is None:
             return output.fill_(0)
-        if attn_metadata.use_cascade:
-            raise RuntimeError(
-                "Cascade must be disabled by the v1 metadata builder; it is "
-                "scheduled for the second implementation phase."
-            )
         if isinstance(attn_metadata.causal, torch.Tensor):
             raise NotImplementedError(
                 "Per-sequence dynamic causal masks are unsupported."
@@ -208,21 +201,97 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
 
-        torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd(
-            query[:num_actual_tokens],
-            key_cache,
-            value_cache,
-            output[:num_actual_tokens],
-            attn_metadata.query_start_loc,
-            attn_metadata.seq_lens,
-            attn_metadata.block_table,
-            layer._q_scale,
-            layer._k_scale,
-            layer._v_scale,
-            attn_metadata.max_query_len,
-            attn_metadata.max_seq_len,
-            self.scale,
-            bool(attn_metadata.causal),
+        query = query[:num_actual_tokens]
+        actual_output = output[:num_actual_tokens]
+
+        if not attn_metadata.use_cascade:
+            torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd(
+                query,
+                key_cache,
+                value_cache,
+                actual_output,
+                attn_metadata.query_start_loc,
+                attn_metadata.seq_lens,
+                attn_metadata.block_table,
+                layer._q_scale,
+                layer._k_scale,
+                layer._v_scale,
+                attn_metadata.max_query_len,
+                attn_metadata.max_seq_len,
+                self.scale,
+                bool(attn_metadata.causal),
+            )
+            return output
+
+        cu_prefix_query_lens = attn_metadata.cu_prefix_query_lens
+        prefix_kv_lens = attn_metadata.prefix_kv_lens
+        suffix_kv_lens = attn_metadata.suffix_kv_lens
+        if (
+            cu_prefix_query_lens is None
+            or prefix_kv_lens is None
+            or suffix_kv_lens is None
+        ):
+            raise RuntimeError("Cascade metadata is incomplete.")
+        page_size = key_cache.shape[1]
+        if attn_metadata.common_prefix_len % page_size != 0:
+            raise RuntimeError(
+                "Cascade common prefix must be page aligned, got "
+                f"{attn_metadata.common_prefix_len} tokens for page size "
+                f"{page_size}."
+            )
+        num_common_blocks = attn_metadata.common_prefix_len // page_size
+        if num_common_blocks <= 0:
+            raise RuntimeError("Cascade requires a non-empty common prefix.")
+
+        logger.info_once(
+            "Executing FA2-derived SM80 FP8 cascade attention with a "
+            "%d-token shared prefix",
+            attn_metadata.common_prefix_len,
+        )
+        prefix_output = torch.empty_like(query)
+        suffix_output = torch.empty_like(query)
+        prefix_output, prefix_lse = (
+            torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
+                query,
+                key_cache,
+                value_cache,
+                prefix_output,
+                cu_prefix_query_lens,
+                prefix_kv_lens,
+                attn_metadata.block_table[:1],
+                layer._q_scale,
+                layer._k_scale,
+                layer._v_scale,
+                num_actual_tokens,
+                attn_metadata.common_prefix_len,
+                self.scale,
+                False,
+            )
+        )
+        suffix_output, suffix_lse = (
+            torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
+                query,
+                key_cache,
+                value_cache,
+                suffix_output,
+                attn_metadata.query_start_loc,
+                suffix_kv_lens,
+                attn_metadata.block_table[:, num_common_blocks:],
+                layer._q_scale,
+                layer._k_scale,
+                layer._v_scale,
+                attn_metadata.max_query_len,
+                attn_metadata.max_seq_len - attn_metadata.common_prefix_len,
+                self.scale,
+                True,
+            )
+        )
+        merge_attn_states(
+            actual_output,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
         )
         return output
 

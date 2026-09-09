@@ -10,6 +10,8 @@ struct Flash_fwd_sm80_fp8_params : public Flash_fwd_params {
     const float *__restrict__ q_scale_ptr;
     const float *__restrict__ k_scale_ptr;
     const float *__restrict__ v_scale_ptr;
+    bool packed_decode_gqa;
+    bool return_softmax_lse;
 };
 
 void run_mha_fwd_sm80_fp8(Flash_fwd_sm80_fp8_params &params,
