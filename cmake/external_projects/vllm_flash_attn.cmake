@@ -57,6 +57,55 @@ install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_
 FetchContent_MakeAvailable(vllm-flash-attn)
 message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 
+# Independent SM80-only FA2-derived kernel for static-scale QKV E4M3FN QDQ.
+# It deliberately has a separate torch namespace and shared object so the
+# stock _vllm_fa2_C implementation and dispatch remain untouched.
+set(VLLM_FA2_SM80_FP8_DIR
+  "${CMAKE_SOURCE_DIR}/csrc/attention/fa2_sm80_fp8")
+set(VLLM_FA2_SM80_FP8_CUDA_SRC
+  "${VLLM_FA2_SM80_FP8_DIR}/flash_fwd_sm80_fp8.cu")
+set(VLLM_FA2_SM80_FP8_SRC
+  "${VLLM_FA2_SM80_FP8_DIR}/flash_api_sm80_fp8.cpp"
+  "${VLLM_FA2_SM80_FP8_DIR}/flash_api_sm80_fp8_torch_lib.cpp"
+  "${VLLM_FA2_SM80_FP8_CUDA_SRC}")
+
+get_torch_gpu_compiler_flags(VLLM_FA2_SM80_FP8_FLAGS CUDA)
+list(APPEND VLLM_FA2_SM80_FP8_FLAGS
+  --expt-relaxed-constexpr
+  --expt-extended-lambda
+  --use_fast_math
+  -DCUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+if(NVCC_THREADS)
+  list(APPEND VLLM_FA2_SM80_FP8_FLAGS "--threads=${NVCC_THREADS}")
+endif()
+set_gencode_flags_for_srcs(
+  SRCS "${VLLM_FA2_SM80_FP8_CUDA_SRC}"
+  CUDA_ARCHS "8.0")
+
+define_gpu_extension_target(
+  _vllm_fa2_sm80_fp8_C
+  DESTINATION vllm_flash_attn
+  LANGUAGE CUDA
+  SOURCES ${VLLM_FA2_SM80_FP8_SRC}
+  COMPILE_FLAGS ${VLLM_FA2_SM80_FP8_FLAGS}
+  USE_SABI 3
+  WITH_SOABI)
+target_include_directories(_vllm_fa2_sm80_fp8_C PRIVATE
+  ${VLLM_FA2_SM80_FP8_DIR}
+  ${vllm-flash-attn_SOURCE_DIR}/csrc/flash_attn
+  ${vllm-flash-attn_SOURCE_DIR}/csrc/flash_attn/src
+  ${vllm-flash-attn_SOURCE_DIR}/csrc/common
+  ${vllm-flash-attn_SOURCE_DIR}/csrc/cutlass/include)
+target_compile_definitions(_vllm_fa2_sm80_fp8_C PRIVATE
+  FLASHATTENTION_DISABLE_BACKWARD
+  FLASHATTENTION_DISABLE_DROPOUT
+  FLASHATTENTION_DISABLE_PYBIND
+  USE_CUDA
+  TORCH_TARGET_VERSION=0x020A000000000000ULL)
+set_target_properties(_vllm_fa2_sm80_fp8_C PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON)
+
 # Restore the install prefix after FA's install rules
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)

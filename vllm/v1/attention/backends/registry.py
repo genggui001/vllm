@@ -50,6 +50,10 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.flash_attn_fp8_qdq_sm80."
         "FlashAttentionKvFp8QdqSm80Backend"
     )
+    FLASH_ATTN_QKV_FP8_SM80_FUSED = (
+        "vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused."
+        "FlashAttentionQkvFp8Sm80FusedBackend"
+    )
     FLASH_ATTN_DIFFKV = (
         "vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend"
     )
