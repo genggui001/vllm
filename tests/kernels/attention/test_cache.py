@@ -1466,3 +1466,36 @@ def test_concat_and_cache_mla_cpu(
 
     ops.concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale)
     torch.testing.assert_close(kv_cache, ref_kv_cache)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.has_device_capability(80),
+    reason="CUDA SM80 or newer is required",
+)
+@pytest.mark.parametrize("num_heads", [1, 4, 17])
+@pytest.mark.parametrize("num_tokens", [1, 65, 2048])
+@pytest.mark.parametrize("per_head", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fp8_hnd_cache_bytes_match_nhd(num_heads, num_tokens, per_head, dtype):
+    """Every HND warp must write its heads and preserve masked/unused slots."""
+    torch.manual_seed(612)
+    device = "cuda:0"
+    blocks = (num_tokens + 15) // 16 + 2
+    key = torch.randn(num_tokens + 2, num_heads, 256, dtype=dtype, device=device)
+    value = torch.randn_like(key)
+    slots = torch.randperm(blocks * 16, device=device)[:num_tokens]
+    if num_tokens > 1:
+        slots[0] = -1
+    scales = torch.full((num_heads if per_head else 1,), 0.0113, device=device)
+    packed = torch.full(
+        (blocks, num_heads, 16, 512), 85, dtype=torch.uint8, device=device
+    )
+    key_hnd, value_hnd = packed.transpose(1, 2).split(256, dim=-1)
+    key_nhd = key_hnd.contiguous()
+    value_nhd = value_hnd.contiguous()
+    for kc, vc in [(key_nhd, value_nhd), (key_hnd, value_hnd)]:
+        ops.reshape_and_cache_flash(
+            key, value, kc, vc, slots, "fp8_e4m3", scales, scales
+        )
+    assert torch.equal(key_hnd, key_nhd)
+    assert torch.equal(value_hnd, value_nhd)

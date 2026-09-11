@@ -93,13 +93,25 @@ def _silu_mul_fp8_e4m3_per_token_qdq_kernel(
     )
 
 
-def _launch_config(n_cols: int) -> tuple[int, int]:
+def _launch_config(n_cols: int, rows: int, *, swiglu: bool = False) -> tuple[int, int]:
     if n_cols <= 0:
         raise ValueError("FP8 per-token QDQ requires a positive row width.")
     block_size = triton.next_power_of_2(n_cols)
     if block_size > 65536:
         raise ValueError(f"FP8 per-token QDQ row is too wide: {n_cols}.")
     num_warps = 4 if block_size <= 2048 else 8
+    # Small FC1 batches benefit from more lanes per row; large batches need
+    # more resident CTAs. Keep other widths on the established layout.
+    if not swiglu and n_cols == 2048:
+        if rows <= 128:
+            num_warps = 16
+        elif rows <= 512:
+            num_warps = 8
+    elif swiglu and n_cols == 256:
+        if rows <= 64:
+            num_warps = 8
+        elif rows >= 8192:
+            num_warps = 2
     return block_size, num_warps
 
 
@@ -125,7 +137,7 @@ def fp8_e4m3_per_token_qdq_fused(
         raise ValueError("FP8 per-token QDQ tensors must be on the same CUDA device.")
 
     rows, n_cols = x.shape
-    block_size, num_warps = _launch_config(n_cols)
+    block_size, num_warps = _launch_config(n_cols, rows)
     if rows == 0:
         return output
     _fp8_e4m3_per_token_qdq_kernel[(rows,)](
@@ -166,7 +178,7 @@ def silu_mul_fp8_e4m3_per_token_qdq_fused(
         raise ValueError("Fused SwiGLU FP8 QDQ expects matching contiguous tensors.")
 
     rows, n_cols = output.shape
-    block_size, num_warps = _launch_config(n_cols)
+    block_size, num_warps = _launch_config(n_cols, rows, swiglu=True)
     if rows == 0:
         return output
     _silu_mul_fp8_e4m3_per_token_qdq_kernel[(rows,)](

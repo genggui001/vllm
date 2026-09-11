@@ -183,7 +183,7 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
   const int64_t bytes_per_page =
       4LL * page_block_size * num_heads_k * head_size + 4;
   const bool stage_prefill =
-      max_seqlen_q >= 64 && q_and_lse_bytes <= stage_budget &&
+      max_seqlen_q > 16 && q_and_lse_bytes <= stage_budget &&
       int64_t(batch_size) * stage_pages <=
           (stage_budget - q_and_lse_bytes) / bytes_per_page;
   auto softmax_lse = torch::stable::new_empty(

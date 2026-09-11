@@ -26,7 +26,18 @@ def _require_sm80() -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", [(1, 512), (37, 2560), (128, 896)])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 512),
+        (37, 2560),
+        (128, 896),
+        (64, 2048),
+        (512, 2048),
+        (8192, 256),
+        (16384, 256),
+    ],
+)
 def test_fused_per_token_qdq_matches_reference(dtype: torch.dtype, shape):
     _require_sm80()
     torch.manual_seed(0)
@@ -130,7 +141,18 @@ def test_fused_qdq_all_finite_input_codes(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape", [(1, 512), (37, 2560), (128, 896)])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 512),
+        (37, 2560),
+        (128, 896),
+        (64, 2048),
+        (512, 2048),
+        (8192, 256),
+        (16384, 256),
+    ],
+)
 def test_fused_swiglu_qdq_matches_reference(dtype: torch.dtype, shape):
     _require_sm80()
     torch.manual_seed(1)

@@ -219,7 +219,8 @@ inline __device__ void compute_attn_sm80_fp8(
   static_assert(
       (kBlockM == 64 || kBlockM == 128 || (IsDecode && kBlockM == 16)) &&
       kBlockN == 64 && kHeadDim == 256 &&
-      (KernelTraits::kNThreads == 128 || KernelTraits::kNThreads == 256));
+      ((IsDecode && KernelTraits::kNThreads == 64) ||
+       KernelTraits::kNThreads == 128 || KernelTraits::kNThreads == 256));
 
   extern __shared__ char smem_raw[];
   const int tidx = threadIdx.x;

@@ -11,15 +11,20 @@ using Sm80Fp8Traits =
     Flash_fwd_kernel_traits<256, 64, 64, 4, true, true, cutlass::bfloat16_t>;
 
 // Each warp preserves FA2's complete score/softmax reduction, while owning
-// only 64 output columns. Cooperative K/V loading still uses all four warps.
-struct Sm80Fp8DecodeTraits
-    : Flash_fwd_kernel_traits<256, 16, 64, 4, true, true, cutlass::bfloat16_t> {
-  using Base = Flash_kernel_traits<256, 16, 64, 4, cutlass::bfloat16_t>;
+// a partition of the output columns. K/V loading uses the entire CTA.
+template <int NWarps>
+struct Sm80Fp8DecodeTraitsBase
+    : Flash_fwd_kernel_traits<256, 16, 64, NWarps, true, true,
+                              cutlass::bfloat16_t> {
+  using Base = Flash_kernel_traits<256, 16, 64, NWarps, cutlass::bfloat16_t>;
   using TiledMma =
       cute::TiledMMA<typename Base::MMA_Atom_Arch,
                      cute::Layout<cute::Shape<cute::_1, cute::_1, cute::_1>>,
                      cute::Tile<cute::_16, cute::_16, cute::_16>>;
 };
+
+using Sm80Fp8DecodeTraits = Sm80Fp8DecodeTraitsBase<4>;
+using Sm80Fp8CompactDecodeTraits = Sm80Fp8DecodeTraitsBase<2>;
 
 __global__ void flash_fwd_sm80_fp8_kernel(
     const Flash_fwd_sm80_fp8_params params) {
@@ -32,10 +37,10 @@ __global__ void flash_fwd_sm80_fp8_unaligned_kernel(
 }
 
 __global__ __launch_bounds__(
-    Sm80Fp8DecodeTraits::kNThreads,
+    Sm80Fp8CompactDecodeTraits::kNThreads,
     3) void flash_decode_sm80_fp8_kernel(const Flash_fwd_sm80_fp8_params
                                              params) {
-  compute_attn_sm80_fp8<Sm80Fp8DecodeTraits, true, true, true>(params);
+  compute_attn_sm80_fp8<Sm80Fp8CompactDecodeTraits, true, true, true>(params);
 }
 
 __global__ void flash_decode_sm80_fp8_small_grid_kernel(
@@ -85,14 +90,15 @@ void run_mha_fwd_sm80_fp8(Flash_fwd_sm80_fp8_params& params,
       return;
     }
     constexpr size_t decode_smem_size =
-        Sm80Fp8DecodeTraits::kSmemSize -
-        Sm80Fp8DecodeTraits::kBlockN * Sm80Fp8DecodeTraits::kHeadDim +
+        Sm80Fp8CompactDecodeTraits::kSmemSize -
+        Sm80Fp8CompactDecodeTraits::kBlockN *
+            Sm80Fp8CompactDecodeTraits::kHeadDim +
         2 * 256 * sizeof(cutlass::bfloat16_t);
     FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
         flash_decode_sm80_fp8_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, decode_smem_size));
     flash_decode_sm80_fp8_kernel<<<dim3(1, params.b, params.h),
-                                   Sm80Fp8DecodeTraits::kNThreads,
+                                   Sm80Fp8CompactDecodeTraits::kNThreads,
                                    decode_smem_size, stream>>>(params);
     FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
     return;
@@ -116,14 +122,27 @@ void run_mha_fwd_sm80_fp8(Flash_fwd_sm80_fp8_params& params,
 // FP8 QDQ arithmetic is shared with the existing kernel, including signed zero.
 __global__ void stage_sm80_fp8_prefill_q(const Flash_fwd_sm80_fp8_params params,
                                          cutlass::bfloat16_t* staged_q) {
-  const int row = blockIdx.x;
-  const int head = blockIdx.y;
+  constexpr int kVec = 8;
+  const int64_t vec = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t head_row = vec / (256 / kVec);
+  if (head_row >= int64_t(params.total_q) * params.h) return;
+  const int row = head_row / params.h;
+  const int head = head_row % params.h;
+  const int col = (vec % (256 / kVec)) * kVec;
   const auto* q = static_cast<const cutlass::bfloat16_t*>(params.q_ptr);
   const int64_t src = int64_t(row) * params.q_row_stride +
-                      int64_t(head) * params.q_head_stride + threadIdx.x;
-  const int64_t dst = (int64_t(row) * params.h + head) * 256 + threadIdx.x;
-  staged_q[dst] = cutlass::bfloat16_t(
-      scaled_e4m3fn_qdq(float(q[src]), __ldg(params.q_scale_ptr)));
+                      int64_t(head) * params.q_head_stride + col;
+  using Vector = cutlass::Array<cutlass::bfloat16_t, kVec>;
+  const auto values = *reinterpret_cast<const Vector*>(q + src);
+  alignas(16) Vector converted;
+  const float scale = __ldg(params.q_scale_ptr);
+#pragma unroll
+  for (int i = 0; i < kVec; ++i) {
+    converted[i] =
+        cutlass::bfloat16_t(scaled_e4m3fn_qdq(float(values[i]), scale));
+  }
+  *reinterpret_cast<uint4*>(staged_q + vec * kVec) =
+      *reinterpret_cast<const uint4*>(&converted);
 }
 
 __global__ void stage_sm80_fp8_prefill_kv(
@@ -143,9 +162,10 @@ __global__ void stage_sm80_fp8_prefill_kv(
   const auto* v = static_cast<const uint8_t*>(params.v_ptr);
   const float k_scale = __ldg(params.k_scale_ptr);
   const float v_scale = __ldg(params.v_scale_ptr);
-  for (int i = threadIdx.x; i < 16 * 256; i += blockDim.x) {
-    const int row = i / 256;
-    const int col = i % 256;
+  constexpr int kVec = 8;
+  for (int vec = threadIdx.x; vec < 16 * 256 / kVec; vec += blockDim.x) {
+    const int row = vec / (256 / kVec);
+    const int col = (vec % (256 / kVec)) * kVec;
     if (page * 16 + row < length) {
       const int64_t k_offset = int64_t(physical_page) * params.k_batch_stride +
                                int64_t(row) * params.k_row_stride +
@@ -155,8 +175,20 @@ __global__ void stage_sm80_fp8_prefill_kv(
                                int64_t(head) * params.v_head_stride + col;
       const int64_t out =
           ((int64_t(compact_page) * 16 + row) * params.h_k + head) * 256 + col;
-      staged_k[out] = cutlass::bfloat16_t(decode_e4m3fn(k[k_offset]) * k_scale);
-      staged_v[out] = cutlass::bfloat16_t(decode_e4m3fn(v[v_offset]) * v_scale);
+      const uint64_t k_bits = *reinterpret_cast<const uint64_t*>(k + k_offset);
+      const uint64_t v_bits = *reinterpret_cast<const uint64_t*>(v + v_offset);
+      alignas(16) cutlass::Array<cutlass::bfloat16_t, kVec> k_values, v_values;
+#pragma unroll
+      for (int i = 0; i < kVec; ++i) {
+        k_values[i] = cutlass::bfloat16_t(
+            decode_e4m3fn(static_cast<uint8_t>(k_bits >> (8 * i))) * k_scale);
+        v_values[i] = cutlass::bfloat16_t(
+            decode_e4m3fn(static_cast<uint8_t>(v_bits >> (8 * i))) * v_scale);
+      }
+      *reinterpret_cast<uint4*>(staged_k + out) =
+          *reinterpret_cast<const uint4*>(&k_values);
+      *reinterpret_cast<uint4*>(staged_v + out) =
+          *reinterpret_cast<const uint4*>(&v_values);
     }
   }
 }
@@ -176,7 +208,8 @@ __global__ __launch_bounds__(
 void run_mha_fwd_sm80_fp8_staged(const Flash_fwd_sm80_fp8_params& source,
                                  void* q, void* k, void* v, int* block_table,
                                  int pages_per_sequence, cudaStream_t stream) {
-  stage_sm80_fp8_prefill_q<<<dim3(source.total_q, source.h), 256, 0, stream>>>(
+  const int64_t q_vectors = int64_t(source.total_q) * source.h * (256 / 8);
+  stage_sm80_fp8_prefill_q<<<(q_vectors + 127) / 128, 128, 0, stream>>>(
       source, static_cast<cutlass::bfloat16_t*>(q));
   FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
   stage_sm80_fp8_prefill_kv<<<dim3(pages_per_sequence, source.b, source.h_k),

@@ -82,6 +82,10 @@ def _qdq(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         ([1, 1], [17, 31], True),  # zero-copy decode GQA packing
         ([1, 1], [127, 512], True),  # multiple async tiles and a partial page
         ([1, 1], [1025, 2048], True),  # long decode with repeated buffer reuse
+        pytest.param([1] * 63, [257] * 63, True, id="decode-grid-below"),
+        pytest.param([1] * 65, [257] * 65, True, id="decode-grid-above"),
+        pytest.param([17], [8193], True, id="prefill-staging-first-row"),
+        pytest.param([18], [28690], True, id="prefill-long-tail"),
         ([1] * 64, [129 + 3 * i for i in range(64)], True),  # compact grid
         ([16, 16], [511, 2048], True),  # all rows of the small-query tile
         ([1, 3], [17, 31], True),
