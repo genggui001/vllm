@@ -8,7 +8,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 export MAX_JOBS="${MAX_JOBS:-12}"
 export NVCC_THREADS="${NVCC_THREADS:-1}"
-export VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE:-0.28.0+sm80w4a8qkv8}"
+export VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE:-0.28.0+sm80w4a8qkv8.autoselect1}"
 export VLLM_TARGET_DEVICE=cuda
 
 # Conda compiler activation can inject an absolute RPATH into linker flags.

@@ -212,6 +212,7 @@ def select_wna16_moe_backend(
     may_have_zp: bool,
     may_have_bias: bool,
     allow_tile_padding: bool = False,
+    use_fp8_qdq: bool = False,
 ) -> tuple[WNA16MoEBackend, type[mk.FusedMoEExperts]]:
     """Select the WNA16 MoE backend.
 
@@ -266,6 +267,14 @@ def select_wna16_moe_backend(
 
     # Handle explicit moe_backend from user.
     runner_backend = config.moe_backend
+    if use_fp8_qdq:
+        if runner_backend not in ("auto", "marlin_fp8_qdq_fused"):
+            raise ValueError(
+                "SM80 token FP8 activations require marlin_fp8_qdq_fused, "
+                f"but moe_backend={runner_backend!r} was explicitly requested. "
+                "Use auto or marlin_fp8_qdq_fused to preserve activation QDQ."
+            )
+        runner_backend = "marlin_fp8_qdq_fused"
     if runner_backend != "auto":
         requested_backend = map_wna16_backend(runner_backend)
         reason = _backend_incompatibility_reason(

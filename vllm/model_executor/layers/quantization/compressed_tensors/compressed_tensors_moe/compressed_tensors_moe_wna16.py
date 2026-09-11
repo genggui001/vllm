@@ -57,6 +57,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         input_quant: QuantizationArgs | None,
         moe: FusedMoEConfig,
         layer_name: str | None = None,
+        *,
+        use_fp8_qdq: bool = False,
     ):
         super().__init__(moe)
         self.weight_quant = weight_quant
@@ -104,6 +106,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             may_have_zp=not self.symmetric,
             may_have_bias=False,
             allow_tile_padding=not is_actorder,
+            use_fp8_qdq=use_fp8_qdq,
         )
 
         self.is_marlin = self.wna16_backend in [

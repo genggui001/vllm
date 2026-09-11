@@ -17,9 +17,10 @@ Q/K/V scales, and computes FA2 attention in BF16.
 - Paged K/V with 16 tokens per page and scalar FP32 Q/K/V scales.
 - W4 compressed-tensors MoE weights and SILU/SwiGLU activation, with router
   weights applied after FC2. Leave `VLLM_MARLIN_INPUT_DTYPE` unset.
-- The example quantization override is for the evaluated Qwen3-Next checkpoint
-  layout. Use the checkpoint's calibrated scales and matching weight format.
-  It does not turn an arbitrary BF16 checkpoint into a calibrated W4A8 model.
+- Packed symmetric INT4 MoE weights, group size 128, without activation ordering;
+  symmetric dynamic token E4M3 activations from the checkpoint configuration.
+- The checkpoint must contain calibrated static per-tensor FP8 Q/K/V scales.
+  These settings do not quantize an arbitrary BF16 checkpoint into this format.
 - ALiBi, sliding windows, softcap, DCP, and output quantization are rejected.
 
 `compilation.json` retains the original graph capture order and adds exactly
@@ -38,6 +39,22 @@ script, then run:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 bash examples/others/sm80_w4a8qkv8/serve.sh /path/to/model
 ```
+
+The FP8 profile keeps the checkpoint's original `input_activations` configuration
+and passes `--kv-cache-dtype fp8_e4m3` (`fp8` is also accepted). On SM80, vLLM
+automatically selects `FLASH_ATTN_QKV_FP8_SM80_FUSED` for a matching W4A8/QKV8
+checkpoint and `marlin_fp8_qdq_fused` for its quantized MoE layers. No
+`--hf-overrides`, `--attention-backend`, or `--moe-backend` option is needed.
+The log reports the selected backends. Explicit attention backend settings take
+precedence; an explicitly incompatible MoE backend raises an error instead of
+discarding token FP8 activation quantization. Unsupported shapes and quantization
+schemes remain subject to backend validation.
+
+This automatic selection requires the `autoselect1` revision or its source
+changes. The original `0.28.0+sm80w4a8qkv8.cu132` wheel predates this interface.
+Its explicit-backend launch configuration remains accepted by this revision.
+Externally selecting FP8 describes the actual E4M3 byte cache; the custom kernel
+dequantizes it for BF16 attention math and applies query QDQ exactly once.
 
 The example defaults to TP equal to the number of visible GPUs, maximum model
 length 262144, batch budget 2048, maximum 256 sequences, and memory utilization

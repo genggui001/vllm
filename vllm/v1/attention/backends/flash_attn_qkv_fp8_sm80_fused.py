@@ -41,10 +41,43 @@ class FlashAttentionQkvFp8Sm80FusedMetadataBuilder(FlashAttentionMetadataBuilder
 class FlashAttentionQkvFp8Sm80FusedBackend(FlashAttentionBackend):
     """Publish a byte-packed cache without changing the stock FA2 backend."""
 
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ]
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        return kv_cache_dtype is None or kv_cache_dtype in cls.supported_kv_cache_dtypes
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        # The custom loader handles FP8; the inherited FA2 math consumes BF16.
+        return super().supports_combination(
+            head_size,
+            dtype,
+            "bfloat16",
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        )
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
@@ -95,8 +128,37 @@ class FlashAttentionQkvFp8Sm80FusedBackend(FlashAttentionBackend):
 class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
     """Run BF16 tensor-core FA2 while decoding FP8 K/V tiles in the loader."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise NotImplementedError(
+                "SM80 fused attention supports E4M3 KV cache, "
+                f"got kv_cache_dtype={kv_cache_dtype}."
+            )
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            "bfloat16",
+            *args,
+            **kwargs,
+        )
+        self.kv_cache_dtype = kv_cache_dtype
+        # Q quantization is performed exactly once by the custom CUDA kernel.
+        self.supports_quant_query_input = False
         if _EXTENSION_ERROR is not None:
             raise ImportError(
                 "_vllm_fa2_sm80_fp8_C is not installed: " + _EXTENSION_ERROR
@@ -115,11 +177,6 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
         if self.head_size != 256:
             raise NotImplementedError(
                 f"The v1 fused kernel requires head_dim=256, got {self.head_size}."
-            )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
-            raise NotImplementedError(
-                "The backend selection controls its uint8 cache; external "
-                f"kv_cache_dtype must be auto/bfloat16, got {self.kv_cache_dtype}."
             )
         if self.alibi_slopes is not None:
             raise NotImplementedError("The v1 fused kernel does not support ALiBi.")

@@ -521,3 +521,187 @@ def test_cuda_graph_replay_refreshes_queries_pages_and_lengths(query_lens, kv_le
         graph.replay()
         assert torch.equal(args[3].view(torch.int16), expected.view(torch.int16))
     torch.accelerator.synchronize()
+
+
+def _sm80_fp8_checkpoint_config():
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsConfig,
+    )
+
+    return CompressedTensorsConfig.from_config(
+        {
+            "format": "pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "int",
+                        "strategy": "group",
+                        "group_size": 128,
+                        "symmetric": True,
+                        "dynamic": False,
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "strategy": "token",
+                        "dynamic": True,
+                        "symmetric": True,
+                    },
+                }
+            },
+            "kv_cache_scheme": {
+                "num_bits": 8,
+                "type": "float",
+                "strategy": "tensor",
+                "symmetric": True,
+                "dynamic": False,
+            },
+        }
+    )
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
+def test_sm80_original_fp8_config_selects_both_backends(cache_dtype, monkeypatch):
+    """Unmodified token-FP8 metadata must enable QDQ without global config mutation."""
+    from unittest.mock import Mock
+
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.experts.marlin_fp8_qdq_fused_moe import (
+        MarlinFp8QdqFusedExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+    from vllm.v1.attention.selector import get_attn_backend
+
+    monkeypatch.delenv("VLLM_MARLIN_INPUT_DTYPE", raising=False)
+    quant = _sm80_fp8_checkpoint_config()
+    activation = quant.target_scheme_map["Linear"]["input_activations"]
+    before = activation.model_dump()
+    config = VllmConfig(
+        quant_config=quant, cache_config=CacheConfig(cache_dtype=cache_dtype)
+    )
+    with set_current_vllm_config(config):
+        moe = make_dummy_moe_config(
+            num_experts=256, experts_per_token=8, hidden_dim=2048, intermediate_size=256
+        )
+        layer = Mock(spec=RoutedExperts)
+        layer.moe_config = moe
+        method = quant.get_quant_method(layer, "model.layers.0.mlp.experts")
+        assert method.experts_cls is MarlinFp8QdqFusedExperts
+        assert method.input_quant is activation
+        assert activation.model_dump() == before
+        assert moe.moe_backend == "auto"
+        assert config.kernel_config.moe_backend == "auto"
+        assert (
+            get_attn_backend(256, torch.bfloat16, cache_dtype)
+            is FlashAttentionQkvFp8Sm80FusedBackend
+        )
+    assert config.attention_config.backend is None
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
+def test_sm80_fp8_cache_keeps_bf16_queries_and_byte_storage(cache_dtype):
+    """FP8 configuration must avoid native FA2 rejection and double Q quantization."""
+    from vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused import (
+        FlashAttentionQkvFp8Sm80FusedImpl,
+    )
+
+    impl = FlashAttentionQkvFp8Sm80FusedImpl(8, 256, 0.0625, 4, None, None, cache_dtype)
+    assert impl.kv_cache_dtype == cache_dtype
+    assert impl.supports_quant_query_input is False
+    spec = AttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=256,
+        dtype=torch.uint8,
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+    )
+    actual = FlashAttentionQkvFp8Sm80FusedBackend.customize_spec(spec)
+    assert actual.dtype == torch.uint8
+    assert actual.kv_quant_mode == KVQuantMode.SM80_FP8_PER_TENSOR
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+def test_sm80_auto_selection_preserves_explicit_attention_backend():
+    from vllm.config import (
+        AttentionConfig,
+        CacheConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+    from vllm.v1.attention.selector import get_attn_backend
+
+    config = VllmConfig(
+        quant_config=_sm80_fp8_checkpoint_config(),
+        cache_config=CacheConfig(cache_dtype="bfloat16"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.FLASH_ATTN),
+    )
+    with set_current_vllm_config(config):
+        assert (
+            get_attn_backend(256, torch.bfloat16, "bfloat16") is FlashAttentionBackend
+        )
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+def test_sm80_auto_moe_does_not_silently_drop_fp8_for_explicit_marlin(monkeypatch):
+    from unittest.mock import Mock
+
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.layer import RoutedExperts
+
+    monkeypatch.delenv("VLLM_MARLIN_INPUT_DTYPE", raising=False)
+    quant = _sm80_fp8_checkpoint_config()
+    config = VllmConfig(
+        quant_config=quant, kernel_config=KernelConfig(moe_backend="marlin")
+    )
+    with set_current_vllm_config(config):
+        layer = Mock(spec=RoutedExperts)
+        layer.moe_config = make_dummy_moe_config(
+            num_experts=256, experts_per_token=8, hidden_dim=2048, intermediate_size=256
+        )
+        layer.moe_config.moe_backend = config.kernel_config.moe_backend
+        with pytest.raises(ValueError, match="explicitly requested"):
+            quant.get_quant_method(layer, "model.layers.0.mlp.experts")
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize(
+    "change",
+    ["int8", "static", "asymmetric", "no_activations", "group32", "per_head_kv"],
+)
+def test_sm80_auto_qkv_does_not_claim_other_quantization_schemes(change):
+    quant = _sm80_fp8_checkpoint_config()
+    scheme = quant.target_scheme_map["Linear"]
+    if change == "int8":
+        scheme["input_activations"].type = "int"
+    elif change == "static":
+        scheme["input_activations"].dynamic = False
+    elif change == "asymmetric":
+        scheme["input_activations"].symmetric = False
+    elif change == "no_activations":
+        scheme["input_activations"] = None
+    elif change == "group32":
+        scheme["weights"].group_size = 32
+    else:
+        quant.kv_cache_scheme["strategy"] = "attn_head"
+    assert not quant.uses_sm80_fp8_qkv()
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize("capability", [(8, 6), (8, 9), (9, 0), (10, 0)])
+def test_sm80_auto_qkv_does_not_replace_other_gpu_backends(capability, monkeypatch):
+    from vllm.platforms import current_platform
+
+    quant = _sm80_fp8_checkpoint_config()
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_capability",
+        lambda *args, **kwargs: DeviceCapability(*capability),
+    )
+    assert not quant.uses_sm80_fp8_qkv()
