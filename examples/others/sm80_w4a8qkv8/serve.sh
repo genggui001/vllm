@@ -21,12 +21,15 @@ for device in "${devices[@]}"; do
 done
 case "${PROFILE:-fp8}" in
     fp8)
-        attention_backend=FLASH_ATTN_QKV_FP8_SM80_FUSED
-        moe_backend=marlin_fp8_qdq_fused
+        quant_args=(--kv-cache-dtype fp8_e4m3)
         ;;
     w4a16)
-        attention_backend=FLASH_ATTN
-        moe_backend=marlin
+        quant_args=(
+            --kv-cache-dtype bfloat16
+            --attention-backend FLASH_ATTN
+            --moe-backend marlin
+            --hf-overrides "$(cat "$script_dir/qwen3_next_quantization.json")"
+        )
         ;;
     *) echo "PROFILE must be fp8 or w4a16" >&2; exit 2 ;;
 esac
@@ -37,10 +40,7 @@ exec "${VLLM_BIN:-vllm}" serve "$model_path" \
     --max-num-seqs 256 \
     --max-num-batched-tokens 2048 \
     --gpu-memory-utilization 0.8 \
-    --kv-cache-dtype bfloat16 \
-    --attention-backend "$attention_backend" \
-    --moe-backend "$moe_backend" \
-    --hf-overrides "$(cat "$script_dir/qwen3_next_quantization.json")" \
+    "${quant_args[@]}" \
     --compilation-config "$(cat "$script_dir/compilation.json")" \
     --no-enable-prefix-caching \
     --disable-cascade-attn \
