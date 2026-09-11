@@ -193,3 +193,92 @@ def test_get_dummy_block_tables_returns_zeroed_rows():
     assert (dummy[0] == 0).all()
     # CUDA graph invariant: same persistent tensor, not a fresh allocation.
     assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
+
+
+@pytest.mark.parametrize("pin_memory", [False, True])
+def test_v1_hybrid_block_table_incremental_commit(pin_memory):
+    """Page updates and request compaction must reach the persistent GPU table."""
+    from vllm.v1.worker.block_table import BlockTable
+
+    table = BlockTable(
+        block_size=528,
+        max_num_reqs=4,
+        max_num_blocks_per_req=504,
+        max_num_batched_tokens=64,
+        pin_memory=pin_memory,
+        device=torch.device("cuda"),
+        kernel_block_size=16,
+        cp_kv_cache_interleave_size=1,
+    )
+    address = table.block_table.gpu.data_ptr()
+    stride = table.block_table.gpu.stride()
+
+    def check(num_reqs=4):
+        table.commit_block_table(num_reqs)
+        assert torch.equal(
+            table.block_table.gpu[:num_reqs].cpu(),
+            table.block_table.cpu[:num_reqs],
+        )
+        assert table.block_table.gpu.data_ptr() == address
+        assert table.block_table.gpu.stride() == stride
+
+    check(0)
+    table.add_row([7, 9], 0)
+    table.add_row([5], 3)
+    check(1)
+    # An update outside the active batch must survive earlier commits.
+    check(4)
+    check(4)
+    table.append_row([11, 13], 0)
+    table.add_row([2, 4, 6], 1)
+    table.swap_row(0, 1)
+    check()
+    table.move_row(3, 0)
+    table.clear_row(1)
+    check()
+    assert not table.block_table.gpu[3].any()
+    assert not table.block_table.gpu[1].any()
+    table.add_row([], 2)
+    table.add_row([8], 0)
+    check()
+    table.clear()
+    check()
+    table.add_row([21, 22], 2)
+    check()
+
+    # A previously captured reader must see later commits at the same address.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        output = table.block_table.gpu.clone()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output.copy_(table.block_table.gpu)
+    table.swap_row(0, 2)
+    table.append_row([31], 2)
+    table.commit_block_table(4)
+    graph.replay()
+    assert torch.equal(output.cpu(), table.block_table.cpu)
+
+
+@pytest.mark.parametrize("accessor", ["get_cpu_tensor", "get_numpy_array"])
+def test_v1_hybrid_block_table_retained_cpu_view(accessor):
+    """Retained public CPU views can be edited between commits."""
+    from vllm.v1.worker.block_table import BlockTable
+
+    table = BlockTable(
+        block_size=32,
+        max_num_reqs=2,
+        max_num_blocks_per_req=4,
+        max_num_batched_tokens=16,
+        pin_memory=True,
+        device=torch.device("cuda"),
+        kernel_block_size=16,
+        cp_kv_cache_interleave_size=1,
+    )
+    view = getattr(table, accessor)()
+    for value in [17, 29]:
+        view[0, 0] = value
+        table.commit_block_table(1)
+        assert table.block_table.gpu[0, 0].item() == value

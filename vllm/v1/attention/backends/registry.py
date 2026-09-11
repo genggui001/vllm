@@ -42,14 +42,6 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     """
 
     FLASH_ATTN = "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
-    FLASH_ATTN_FP8_QDQ_SM80 = (
-        "vllm.v1.attention.backends.flash_attn_fp8_qdq_sm80."
-        "FlashAttentionFp8QdqSm80Backend"
-    )
-    FLASH_ATTN_KV_FP8_QDQ_SM80 = (
-        "vllm.v1.attention.backends.flash_attn_fp8_qdq_sm80."
-        "FlashAttentionKvFp8QdqSm80Backend"
-    )
     FLASH_ATTN_QKV_FP8_SM80_FUSED = (
         "vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused."
         "FlashAttentionQkvFp8Sm80FusedBackend"
@@ -58,14 +50,6 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend"
     )
     TRITON_ATTN = "vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"
-    TRITON_ATTN_FP8_SM80 = (
-        "vllm.v1.attention.backends.triton_attn_fp8_sm80."
-        "TritonFp8Sm80AttentionBackend"
-    )
-    TRITON_ATTN_QKV_FP8_SM80 = (
-        "vllm.v1.attention.backends.triton_attn_fp8_sm80."
-        "TritonQkvFp8Sm80AttentionBackend"
-    )
     TRITON_ATTN_DIFFKV = (
         "vllm.v1.attention.backends.triton_attn_diffkv.TritonAttentionDiffKVBackend"
     )

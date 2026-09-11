@@ -108,7 +108,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         self.is_marlin = self.wna16_backend in [
             WNA16MoEBackend.MARLIN,
-            WNA16MoEBackend.MARLIN_FP8_QDQ,
             WNA16MoEBackend.MARLIN_FP8_QDQ_FUSED,
             WNA16MoEBackend.BATCHED_MARLIN,
         ]

@@ -300,6 +300,11 @@ class TestCUDAGraphWrapper:
                 batch_descriptor=batch_descriptor,
             ),
             patch("torch.cuda.graph", wraps=torch.cuda.graph) as mock_cuda_graph,
+            # Production captures on the worker's non-default stream.
+            patch(
+                "vllm.compilation.cuda_graph.current_stream",
+                return_value=torch.cuda.Stream(),
+            ),
         ):
             output1 = wrapper(self.input_tensor)
             # capturing phase should generate a zero output
@@ -569,3 +574,33 @@ def test_nested_wrappers():
     assert action == "bypass"
     assert outer_model.forward.call_count == 2
     assert inner_model.forward.call_count == 1
+
+
+@pytest.mark.parametrize("padding_limit", [None, 512])
+def test_large_graph_padding_policy_preserves_decode(padding_limit):
+    """Exact large captures must not change tail shapes or small decode graphs."""
+    compilation_config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode="FULL_AND_PIECEWISE",
+        cudagraph_capture_sizes=[1, 64, 512, 2048],
+        cudagraph_max_padding_size=padding_limit,
+    )
+    dispatcher = CudagraphDispatcher(
+        _create_vllm_config(compilation_config, max_num_seqs=256)
+    )
+    dispatcher.initialize_cudagraph_keys(
+        cudagraph_mode=compilation_config.cudagraph_mode,
+        uniform_decode_query_len=1,
+    )
+    mode, batch = dispatcher.dispatch(63, uniform_decode=True)
+    assert mode == CUDAGraphMode.FULL
+    assert batch.num_tokens == 64
+    mode, batch = dispatcher.dispatch(2048, uniform_decode=False)
+    assert mode == CUDAGraphMode.PIECEWISE
+    assert batch.num_tokens == 2048
+    for tokens in [513, 1042, 2047]:
+        mode, batch = dispatcher.dispatch(tokens, uniform_decode=False)
+        assert mode == (
+            CUDAGraphMode.NONE if padding_limit == 512 else CUDAGraphMode.PIECEWISE
+        )
+        assert batch.num_tokens == (tokens if padding_limit == 512 else 2048)

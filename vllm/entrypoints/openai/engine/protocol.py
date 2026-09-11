@@ -410,6 +410,8 @@ class DeltaMessage(OpenAIBaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.reasoning is not None:
+            data.setdefault("reasoning_content", self.reasoning)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
         return data

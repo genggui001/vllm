@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Measure vLLM prefill and decode separately through the OpenAI API."""
 
 import argparse
@@ -51,9 +54,7 @@ def stream_one(
             event = json.loads(line[6:])
             usage = event.get("usage") or {}
             prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens)
-            completion_tokens = int(
-                usage.get("completion_tokens") or completion_tokens
-            )
+            completion_tokens = int(usage.get("completion_tokens") or completion_tokens)
             choices = event.get("choices") or []
             if not choices:
                 continue
@@ -69,11 +70,7 @@ def stream_one(
     if last_content_at is None:
         last_content_at = first_content_at
     decode_time = max(0.0, last_content_at - first_content_at)
-    tpot = (
-        decode_time / (completion_tokens - 1)
-        if completion_tokens > 1
-        else math.nan
-    )
+    tpot = decode_time / (completion_tokens - 1) if completion_tokens > 1 else math.nan
     return {
         "latency_s": finished - started,
         "ttft_s": first_content_at - started,
@@ -105,9 +102,7 @@ def run_batch(
     errors = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [
-            pool.submit(
-                stream_one, base_url, model, prompt, max_tokens, timeout
-            )
+            pool.submit(stream_one, base_url, model, prompt, max_tokens, timeout)
             for prompt in prompts
         ]
         for future in concurrent.futures.as_completed(futures):
@@ -120,9 +115,7 @@ def run_batch(
     completion_tokens = sum(int(row["completion_tokens"]) for row in rows)
     ttfts = [float(row["ttft_s"]) for row in rows]
     tpots = [
-        float(row["tpot_s"])
-        for row in rows
-        if not math.isnan(float(row["tpot_s"]))
+        float(row["tpot_s"]) for row in rows if not math.isnan(float(row["tpot_s"]))
     ]
     result: dict[str, float | int | str] = {
         "phase": phase,
@@ -137,12 +130,8 @@ def run_batch(
         "output_tokens_per_s": round(completion_tokens / wall_s, 1),
         "ttft_p50_s": round(statistics.median(ttfts), 4) if ttfts else math.nan,
         "ttft_p95_s": round(percentile(ttfts, 0.95), 4),
-        "tpot_p50_ms": round(statistics.median(tpots) * 1000, 3)
-        if tpots
-        else math.nan,
-        "tpot_p95_ms": round(percentile(tpots, 0.95) * 1000, 3)
-        if tpots
-        else math.nan,
+        "tpot_p50_ms": round(statistics.median(tpots) * 1000, 3) if tpots else math.nan,
+        "tpot_p95_ms": round(percentile(tpots, 0.95) * 1000, 3) if tpots else math.nan,
     }
     print(json.dumps(result, ensure_ascii=False), flush=True)
     if errors:

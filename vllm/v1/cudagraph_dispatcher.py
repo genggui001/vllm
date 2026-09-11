@@ -87,6 +87,11 @@ class CudagraphDispatcher:
             for bs in range(start, end):
                 if bs == start:
                     self._bs_to_padded_graph_size[bs] = start
+                elif (
+                    self.compilation_config.cudagraph_max_padding_size is not None
+                    and end > self.compilation_config.cudagraph_max_padding_size
+                ):
+                    self._bs_to_padded_graph_size[bs] = bs
                 else:
                     self._bs_to_padded_graph_size[bs] = end
 

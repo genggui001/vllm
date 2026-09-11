@@ -649,6 +649,11 @@ class CompilationConfig:
     """Sizes to capture cudagraph.
     - None (default): capture sizes are inferred from vllm config.
     - list[int]: capture sizes are specified as given."""
+    cudagraph_max_padding_size: int | None = Field(default=None, ge=0)
+    """Largest captured size that may be used by padding a smaller batch.
+    Larger captures require an exact token count. None keeps padding to all
+    capture sizes. This allows large prefill graphs without padding their tails.
+    """
     cudagraph_copy_inputs: bool = False
     """Whether to copy input tensors for
     cudagraph. If the caller can guarantee that the same input buffers
@@ -798,6 +803,7 @@ class CompilationConfig:
             "traced_files",
             "compilation_time",
             "encoder_compilation_time",
+            "cudagraph_max_padding_size",
             "static_forward_context",
             "pass_config",  # handled separately below
             "dynamic_shapes_config",  # handled separately below

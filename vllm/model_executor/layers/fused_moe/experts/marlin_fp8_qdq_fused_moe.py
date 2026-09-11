@@ -20,14 +20,17 @@ from vllm.triton_utils import tl, triton
 def _e4m3fn_qdq_software(values):
     """Round FP32 values to finite E4M3 and decode, without FP8 hardware."""
     magnitude = tl.abs(values)
-    normal_magnitude = tl.maximum(magnitude, 0.015625)
-    exponent = tl.floor(tl.log2(normal_magnitude))
-    exponent = tl.maximum(tl.minimum(exponent, 8.0), -6.0)
-    normal_step = tl.exp2(exponent - 3.0)
-    step = tl.where(magnitude < 0.015625, 0.001953125, normal_step)
-    quantized_magnitude = tl.extra.cuda.libdevice.rint(magnitude / step) * step
+    bits = magnitude.to(tl.int32, bitcast=True)
+    # Keep three fraction bits. The retained LSB supplies the ties-to-even bit.
+    rounded_bits = (bits + 0x7FFFF + ((bits >> 20) & 1)) & -0x100000
+    normal = rounded_bits.to(tl.float32, bitcast=True)
+    subnormal = tl.extra.cuda.libdevice.rint(magnitude * 512.0) * 0.001953125
+    quantized_magnitude = tl.where(magnitude < 0.015625, subnormal, normal)
     quantized_magnitude = tl.minimum(quantized_magnitude, 448.0)
-    return tl.where(values < 0.0, -quantized_magnitude, quantized_magnitude)
+    # Preserve the E4M3 sign bit, including an input negative zero.
+    sign = values.to(tl.int32, bitcast=True) & -2147483648
+    magnitude_bits = quantized_magnitude.to(tl.int32, bitcast=True)
+    return (magnitude_bits | sign).to(tl.float32, bitcast=True)
 
 
 @triton.jit
@@ -73,7 +76,7 @@ def _silu_mul_fp8_e4m3_per_token_qdq_kernel(
 
     gate = tl.load(input_row + offsets, mask=mask, other=0.0).to(tl.float32)
     up = tl.load(input_row + n_cols + offsets, mask=mask, other=0.0).to(tl.float32)
-    silu = gate / (1.0 + tl.extra.cuda.libdevice.exp(-gate))
+    silu = tl.div_rn(gate, 1.0 + tl.extra.cuda.libdevice.exp(-gate))
     # The packed CUDA activation rounds SiLU to the input dtype before the
     # multiply, then rounds the product again when it stores the activation.
     silu = silu.to(input_ptr.dtype.element_ty).to(tl.float32)
@@ -91,6 +94,8 @@ def _silu_mul_fp8_e4m3_per_token_qdq_kernel(
 
 
 def _launch_config(n_cols: int) -> tuple[int, int]:
+    if n_cols <= 0:
+        raise ValueError("FP8 per-token QDQ requires a positive row width.")
     block_size = triton.next_power_of_2(n_cols)
     if block_size > 65536:
         raise ValueError(f"FP8 per-token QDQ row is too wide: {n_cols}.")
@@ -110,13 +115,19 @@ def fp8_e4m3_per_token_qdq_fused(
         )
     if not x.is_contiguous():
         raise ValueError("FP8 per-token QDQ expects contiguous input.")
+    if not x.is_cuda:
+        raise ValueError("FP8 per-token QDQ expects a CUDA input.")
     if output is None:
         output = torch.empty_like(x)
     if output.shape != x.shape or output.dtype != x.dtype or not output.is_contiguous():
         raise ValueError("FP8 per-token QDQ output must match the contiguous input.")
+    if output.device != x.device:
+        raise ValueError("FP8 per-token QDQ tensors must be on the same CUDA device.")
 
     rows, n_cols = x.shape
     block_size, num_warps = _launch_config(n_cols)
+    if rows == 0:
+        return output
     _fp8_e4m3_per_token_qdq_kernel[(rows,)](
         x,
         output,
@@ -138,6 +149,10 @@ def silu_mul_fp8_e4m3_per_token_qdq_fused(
         raise ValueError("Fused SwiGLU FP8 QDQ expects 2D tensors.")
     if input.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"Unsupported input dtype {input.dtype}.")
+    if not input.is_cuda or output.device != input.device:
+        raise ValueError(
+            "Fused SwiGLU FP8 QDQ tensors must be on the same CUDA device."
+        )
     if input.shape[0] != output.shape[0] or input.shape[1] != output.shape[1] * 2:
         raise ValueError(
             f"Expected input [M, 2N] and output [M, N], got "
@@ -152,6 +167,8 @@ def silu_mul_fp8_e4m3_per_token_qdq_fused(
 
     rows, n_cols = output.shape
     block_size, num_warps = _launch_config(n_cols)
+    if rows == 0:
+        return output
     _silu_mul_fp8_e4m3_per_token_qdq_kernel[(rows,)](
         input,
         output,

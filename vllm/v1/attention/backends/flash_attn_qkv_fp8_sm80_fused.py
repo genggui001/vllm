@@ -13,7 +13,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
-from vllm.v1.attention.backend import AttentionLayer, AttentionType
+from vllm.v1.attention.backend import AttentionLayer, AttentionType, MultipleOf
 from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -25,9 +25,7 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
 
 try:
-    importlib.import_module(
-        "vllm.vllm_flash_attn._vllm_fa2_sm80_fp8_C"
-    )
+    importlib.import_module("vllm.vllm_flash_attn._vllm_fa2_sm80_fp8_C")
 
     _EXTENSION_ERROR: str | None = None
 except ImportError as exc:
@@ -36,9 +34,7 @@ except ImportError as exc:
 logger = init_logger(__name__)
 
 
-class FlashAttentionQkvFp8Sm80FusedMetadataBuilder(
-    FlashAttentionMetadataBuilder
-):
+class FlashAttentionQkvFp8Sm80FusedMetadataBuilder(FlashAttentionMetadataBuilder):
     """Use the stock FA2 cascade heuristic and metadata representation."""
 
 
@@ -72,7 +68,7 @@ class FlashAttentionQkvFp8Sm80FusedBackend(FlashAttentionBackend):
         return FlashAttentionQkvFp8Sm80FusedMetadataBuilder
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int]:
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [16]
 
     @classmethod
@@ -155,9 +151,7 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
     ) -> None:
         if kv_cache.dtype != torch.uint8:
             raise TypeError(f"Expected uint8 KV cache, got {kv_cache.dtype}")
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(
-            self.head_size, dim=-1
-        )
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         reshape_and_cache_flash(
             key,
             value,
@@ -195,9 +189,7 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
             raise TypeError(f"Expected uint8 KV cache, got {kv_cache.dtype}")
 
         num_actual_tokens = attn_metadata.num_actual_tokens
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(
-            self.head_size, dim=-1
-        )
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
 
@@ -250,41 +242,37 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
         )
         prefix_output = torch.empty_like(query)
         suffix_output = torch.empty_like(query)
-        prefix_output, prefix_lse = (
-            torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
-                query,
-                key_cache,
-                value_cache,
-                prefix_output,
-                cu_prefix_query_lens,
-                prefix_kv_lens,
-                attn_metadata.block_table[:1],
-                layer._q_scale,
-                layer._k_scale,
-                layer._v_scale,
-                num_actual_tokens,
-                attn_metadata.common_prefix_len,
-                self.scale,
-                False,
-            )
+        prefix_output, prefix_lse = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
+            query,
+            key_cache,
+            value_cache,
+            prefix_output,
+            cu_prefix_query_lens,
+            prefix_kv_lens,
+            attn_metadata.block_table[:1],
+            layer._q_scale,
+            layer._k_scale,
+            layer._v_scale,
+            num_actual_tokens,
+            attn_metadata.common_prefix_len,
+            self.scale,
+            False,
         )
-        suffix_output, suffix_lse = (
-            torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
-                query,
-                key_cache,
-                value_cache,
-                suffix_output,
-                attn_metadata.query_start_loc,
-                suffix_kv_lens,
-                attn_metadata.block_table[:, num_common_blocks:],
-                layer._q_scale,
-                layer._k_scale,
-                layer._v_scale,
-                attn_metadata.max_query_len,
-                attn_metadata.max_seq_len - attn_metadata.common_prefix_len,
-                self.scale,
-                True,
-            )
+        suffix_output, suffix_lse = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
+            query,
+            key_cache,
+            value_cache,
+            suffix_output,
+            attn_metadata.query_start_loc,
+            suffix_kv_lens,
+            attn_metadata.block_table[:, num_common_blocks:],
+            layer._q_scale,
+            layer._k_scale,
+            layer._v_scale,
+            attn_metadata.max_query_len,
+            attn_metadata.max_seq_len - attn_metadata.common_prefix_len,
+            self.scale,
+            True,
         )
         merge_attn_states(
             actual_output,

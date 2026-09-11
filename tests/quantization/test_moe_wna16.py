@@ -32,10 +32,6 @@ def test_map_wna16_backend_supports_triton():
     assert map_wna16_backend("triton") == WNA16MoEBackend.TRITON
 
 
-def test_map_wna16_backend_supports_marlin_fp8_qdq():
-    assert map_wna16_backend("marlin_fp8_qdq") == WNA16MoEBackend.MARLIN_FP8_QDQ
-
-
 def test_map_wna16_backend_supports_marlin_fp8_qdq_fused():
     assert (
         map_wna16_backend("marlin_fp8_qdq_fused")
