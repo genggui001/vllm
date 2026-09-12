@@ -22,6 +22,34 @@ BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
+def _sm80_gdn_o_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    q = args["q"]
+    supported = (
+        q.is_cuda
+        and q.dtype == torch.bfloat16
+        and all(args[name].dtype == torch.bfloat16 for name in ["k", "v", "h", "o"])
+        and (args["H"], args["Hg"], args["K"], args["V"], args["BT"])
+        == (16, 8, 128, 128, 64)
+        and args["USE_G"]
+        and args["IS_VARLEN"]
+        and args["g"].dtype == torch.float32
+        and torch.cuda.get_device_capability(q.device) == (8, 0)
+    )
+    if supported:
+        # Splitting K=128 into two BK64 dots changes FP32 accumulation rounding.
+        chosen = [
+            c
+            for c in configs
+            if c.kwargs == {"BK": 128, "BV": 64}
+            and c.num_warps == 4
+            and c.num_stages == 2
+        ]
+        assert len(chosen) == 1
+        return chosen
+    return configs
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -36,7 +64,8 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         for num_warps in NUM_WARPS
         for num_stages in [2, 3, 4]
     ],
-    key=["H", "K", "V", "BT"],
+    key=["H", "Hg", "K", "V", "BT", "USE_G", "IS_VARLEN"],
+    prune_configs_by={"early_config_prune": _sm80_gdn_o_configs},
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(

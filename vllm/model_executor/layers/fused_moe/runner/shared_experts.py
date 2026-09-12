@@ -43,6 +43,7 @@ class SharedExperts(torch.nn.Module):
         moe_config: FusedMoEConfig,
         enable_dbo: bool,
         mk_can_overlap_shared_experts: Callable[[], bool],
+        enable_sm80_prefill_overlap: bool = False,
     ):
         super().__init__()
 
@@ -51,6 +52,7 @@ class SharedExperts(torch.nn.Module):
         # DBO ubatch id to handle this case.  If DBO is not enabled, the
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
+        self._enable_sm80_prefill_overlap = enable_sm80_prefill_overlap
         self._output: list[torch.Tensor | None] = [None, None]
         self._layer = layer
         self._moe_config = moe_config
@@ -109,8 +111,13 @@ class SharedExperts(torch.nn.Module):
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and self._stream is not None
-            and hidden_states.shape[0]
-            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and (
+                hidden_states.shape[0]
+                <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                or (
+                    self._enable_sm80_prefill_overlap and hidden_states.shape[0] == 2048
+                )
+            )
         )
 
         if should_run_shared_in_aux_stream:

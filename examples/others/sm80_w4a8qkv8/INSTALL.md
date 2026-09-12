@@ -1,6 +1,6 @@
 # v0.28.0-sm80w4a8qkv8 安装说明
 
-发布 wheel：`vllm-0.28.0+sm80w4a8qkv8.cu132-cp312-cp312-linux_x86_64.whl`。
+发布 wheel：`vllm-0.28.0+sm80w4a8qkv8.native1.cu132-cp312-cp312-linux_x86_64.whl`。
 
 验证环境为 Linux x86_64、CPython 3.12.14、PyTorch 2.13.0+cu132、
 CUDA 13.2、Triton 3.7.1、A100-SXM4-80GB，驱动 595.91.07，glibc 2.34。
@@ -13,7 +13,7 @@ CUDA 13.2、Triton 3.7.1、A100-SXM4-80GB，驱动 595.91.07，glibc 2.34。
 
 ```bash
 uv pip install --python .venv/bin/python --no-deps \
-  ./vllm-0.28.0+sm80w4a8qkv8.cu132-cp312-cp312-linux_x86_64.whl
+  ./vllm-0.28.0+sm80w4a8qkv8.native1.cu132-cp312-cp312-linux_x86_64.whl
 .venv/bin/python -c 'import vllm, torch; print(vllm.__version__, vllm.__file__, torch.__version__)'
 ```
 
@@ -32,7 +32,7 @@ uv pip install --python .venv/bin/python --no-deps \
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python \
   --constraint runtime-cu132-constraints.txt \
-  ./vllm-0.28.0+sm80w4a8qkv8.cu132-cp312-cp312-linux_x86_64.whl
+  ./vllm-0.28.0+sm80w4a8qkv8.native1.cu132-cp312-cp312-linux_x86_64.whl
 ```
 
 wheel 未捆绑 PyTorch、CUDA 运行库或模型权重。本模型的 JIT 路径需要可用的 CUDA toolkit 和 `nvcc`，请配置 `CUDA_HOME` 并激活匹配的编译器环境。CUDA/Triton 安装在非标准目录时，
@@ -58,7 +58,7 @@ CUDA_VISIBLE_DEVICES=0,1 bash serve.sh /path/to/calibrated_model \
 
 默认开启最佳 FP8 attention 与 fused MoE QDQ、exact 2048 graph；关闭 prefix cache
 和 cascade。默认 TP 等于可见卡数，最大上下文 262144，最大并发 256，batch budget
-2048，显存比例 0.8，`OMP_NUM_THREADS` 默认为 8。可通过 `MAX_MODEL_LEN`、`TENSOR_PARALLEL_SIZE`、`PORT` 修改对应配置。
+2048，显存比例 0.8。脚本和算子均不设置 `OMP_NUM_THREADS`，直接继承用户环境；未设置时沿用原版 vLLM 的线程策略。可通过 `MAX_MODEL_LEN`、`TENSOR_PARALLEL_SIZE`、`PORT` 修改对应配置。
 
 在相同模型与 graph 配置下使用原生 FA2 + Marlin：
 
@@ -78,7 +78,7 @@ CUDA_VISIBLE_DEVICES=0,1 PROFILE=w4a16 bash serve.sh /path/to/calibrated_model
 在匹配的 CUDA/PyTorch 构建环境中，进入该分支的仓库根目录：
 
 ```bash
-VLLM_VERSION_OVERRIDE=0.28.0+sm80w4a8qkv8.cu132 \
+VLLM_VERSION_OVERRIDE=0.28.0+sm80w4a8qkv8.native1.cu132 \
   bash examples/others/sm80_w4a8qkv8/build-wheel.sh
 ```
 

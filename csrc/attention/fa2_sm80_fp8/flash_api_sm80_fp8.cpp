@@ -52,7 +52,8 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
     const Tensor& cu_seqlens_q, const Tensor& seqused_k,
     const Tensor& block_table, const Tensor& q_scale, const Tensor& k_scale,
     const Tensor& v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
-    double softmax_scale, bool is_causal, bool return_softmax_lse) {
+    double softmax_scale, bool is_causal, bool return_softmax_lse,
+    bool prequantized_q = false) {
   CHECK_DEVICE(q);
   torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
   const auto [cc_major, cc_minor] =
@@ -252,8 +253,9 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
 
   const auto stream = get_current_cuda_stream_sm80_fp8(q);
   if (stage_prefill) {
-    auto staged_q = torch::stable::new_empty(q, {total_q, num_heads, head_size},
-                                             ScalarType::BFloat16);
+    auto staged_q = torch::stable::new_empty(
+        q, {prequantized_q ? 0 : total_q, num_heads, head_size},
+        ScalarType::BFloat16);
     auto staged_kv = torch::stable::new_empty(
         q,
         {2, batch_size * stage_pages, page_block_size, num_heads_k, head_size},
@@ -263,9 +265,12 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
     const int64_t kv_bytes = int64_t(batch_size) * stage_pages *
                              page_block_size * num_heads_k * head_size * 2;
     auto* kv_ptr = static_cast<char*>(staged_kv.data_ptr());
-    run_mha_fwd_sm80_fp8_staged(
-        params, staged_q.data_ptr(), kv_ptr, kv_ptr + kv_bytes,
-        static_cast<int*>(staged_table.data_ptr()), stage_pages, stream);
+    run_mha_fwd_sm80_fp8_staged(params, staged_q.data_ptr(), kv_ptr,
+                                kv_ptr + kv_bytes,
+                                static_cast<int*>(staged_table.data_ptr()),
+                                stage_pages, stream, prequantized_q);
+  } else if (prequantized_q) {
+    run_mha_fwd_sm80_fp8_prequantized_q(params, stream);
   } else {
     run_mha_fwd_sm80_fp8(params, stream);
   }
@@ -293,6 +298,30 @@ std::vector<Tensor> mha_varlen_fwd_sm80_fp8_lse(
   return mha_varlen_fwd_sm80_fp8_impl(
       q, k, v, out, cu_seqlens_q, seqused_k, block_table, q_scale, k_scale,
       v_scale, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, true);
+}
+
+std::vector<Tensor> mha_varlen_fwd_sm80_fp8_prequantized_q(
+    const Tensor& q, const Tensor& k, const Tensor& v, Tensor out,
+    const Tensor& cu_seqlens_q, const Tensor& seqused_k,
+    const Tensor& block_table, const Tensor& q_scale, const Tensor& k_scale,
+    const Tensor& v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal) {
+  return mha_varlen_fwd_sm80_fp8_impl(q, k, v, out, cu_seqlens_q, seqused_k,
+                                      block_table, q_scale, k_scale, v_scale,
+                                      max_seqlen_q, max_seqlen_k, softmax_scale,
+                                      is_causal, false, true);
+}
+
+std::vector<Tensor> mha_varlen_fwd_sm80_fp8_lse_prequantized_q(
+    const Tensor& q, const Tensor& k, const Tensor& v, Tensor out,
+    const Tensor& cu_seqlens_q, const Tensor& seqused_k,
+    const Tensor& block_table, const Tensor& q_scale, const Tensor& k_scale,
+    const Tensor& v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal) {
+  return mha_varlen_fwd_sm80_fp8_impl(q, k, v, out, cu_seqlens_q, seqused_k,
+                                      block_table, q_scale, k_scale, v_scale,
+                                      max_seqlen_q, max_seqlen_k, softmax_scale,
+                                      is_causal, true, true);
 }
 
 }  // namespace FLASH_NAMESPACE

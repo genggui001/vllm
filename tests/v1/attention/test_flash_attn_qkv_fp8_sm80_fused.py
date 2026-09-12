@@ -523,6 +523,55 @@ def test_cuda_graph_replay_refreshes_queries_pages_and_lengths(query_lens, kv_le
     torch.accelerator.synchronize()
 
 
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize("prequantized", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_staged_empty_kv_defines_every_packed_lse_row(prequantized, causal):
+    """A graph must refresh empty-KV LSE without writing past its allocation."""
+    args = _small_op_inputs((128,) * 4, (512,) * 4)
+    args[10] = 256  # Deliberately larger than each packed query segment.
+    args[13] = causal
+    if prequantized:
+        args[0] = _qdq(args[0], args[7])
+    ops = torch.ops._vllm_fa2_sm80_fp8_C
+    op = ops.varlen_fwd_lse_prequantized_q if prequantized else ops.varlen_fwd_lse
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            op(*args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _, lse = op(*args)
+    for lengths in [(0, 0, 0, 0), (0, 1, 128, 512), (512,) * 4]:
+        args[5].copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
+        lse.fill_(12345.0)
+        args[3].fill_(13)
+        graph.replay()
+        assert not bool((lse == 12345).any())
+        assert not bool(torch.isnan(lse).any() | torch.isneginf(lse).any())
+        masked = sum(max(128 - n, 0) if causal else 128 * (n == 0) for n in lengths)
+        assert int(torch.isposinf(lse).sum()) == 8 * masked
+        if not any(lengths):
+            assert not bool(args[3].any())
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize(
+    "query_lens,kv_lens",
+    [((1,) * 32, (129,) * 32), ((17, 33), (128, 256)), ((64, 65), (257, 513))],
+)
+def test_prequantized_query_matches_public_qdq_bits(query_lens, kv_lens):
+    args = _small_op_inputs(query_lens, kv_lens)
+    ops = torch.ops._vllm_fa2_sm80_fp8_C
+    ops.varlen_fwd(*args)
+    reference = args[3].clone()
+    args[0] = _qdq(args[0], args[7])
+    ops.varlen_fwd_prequantized_q(*args)
+    assert torch.equal(reference.view(torch.int16), args[3].view(torch.int16))
+
+
 def _sm80_fp8_checkpoint_config():
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
         CompressedTensorsConfig,

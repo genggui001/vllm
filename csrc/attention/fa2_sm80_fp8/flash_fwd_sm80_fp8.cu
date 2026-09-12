@@ -118,6 +118,98 @@ void run_mha_fwd_sm80_fp8(Flash_fwd_sm80_fp8_params& params,
   FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+__global__ void flash_fwd_sm80_fp8_kernel_prequantized_q(
+    const Flash_fwd_sm80_fp8_params params) {
+  compute_attn_sm80_fp8<Sm80Fp8Traits, false, true, false, true>(params);
+}
+
+__global__ void flash_fwd_sm80_fp8_unaligned_kernel_prequantized_q(
+    const Flash_fwd_sm80_fp8_params params) {
+  compute_attn_sm80_fp8<Sm80Fp8Traits, false, false, false, true>(params);
+}
+
+__global__ __launch_bounds__(
+    Sm80Fp8CompactDecodeTraits::kNThreads,
+    3) void flash_decode_sm80_fp8_kernel_prequantized_q(const Flash_fwd_sm80_fp8_params
+                                                            params) {
+  compute_attn_sm80_fp8<Sm80Fp8CompactDecodeTraits, true, true, true, true>(
+      params);
+}
+
+__global__ void flash_decode_sm80_fp8_small_grid_kernel_prequantized_q(
+    const Flash_fwd_sm80_fp8_params params) {
+  compute_attn_sm80_fp8<Sm80Fp8DecodeTraits, true, true, false, true>(params);
+}
+
+void run_mha_fwd_sm80_fp8_prequantized_q(Flash_fwd_sm80_fp8_params& params,
+                                         cudaStream_t stream) {
+  // Retain the original eight-byte loader for KV views that cannot use
+  // sixteen-byte cp.async transfers. The backend's normal cache is aligned.
+  const uint64_t kv_alignment = reinterpret_cast<uintptr_t>(params.k_ptr) |
+                                reinterpret_cast<uintptr_t>(params.v_ptr) |
+                                params.k_batch_stride | params.k_row_stride |
+                                params.k_head_stride | params.v_batch_stride |
+                                params.v_row_stride | params.v_head_stride;
+  if ((kv_alignment & 15U) != 0) {
+    constexpr size_t fallback_smem_size =
+        Sm80Fp8Traits::kSmemSize + 2 * 256 * sizeof(cutlass::bfloat16_t);
+    FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
+        flash_fwd_sm80_fp8_unaligned_kernel_prequantized_q,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, fallback_smem_size));
+    const dim3 fallback_grid(
+        (params.seqlen_q + Sm80Fp8Traits::kBlockM - 1) / Sm80Fp8Traits::kBlockM,
+        params.b, params.h);
+    flash_fwd_sm80_fp8_unaligned_kernel_prequantized_q<<<
+        fallback_grid, Sm80Fp8Traits::kNThreads, fallback_smem_size, stream>>>(
+        params);
+    FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  if (params.seqlen_q <= 16) {
+    // For smaller grids, spills cost more than the extra CTA residency.
+    // Retain separate raw K/V buffers and the unconstrained register budget.
+    if (params.b * params.h < 256) {
+      constexpr size_t small_grid_smem_size =
+          Sm80Fp8DecodeTraits::kSmemSize +
+          2 * 256 * sizeof(cutlass::bfloat16_t);
+      FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
+          flash_decode_sm80_fp8_small_grid_kernel_prequantized_q,
+          cudaFuncAttributeMaxDynamicSharedMemorySize, small_grid_smem_size));
+      flash_decode_sm80_fp8_small_grid_kernel_prequantized_q<<<
+          dim3(1, params.b, params.h), Sm80Fp8DecodeTraits::kNThreads,
+          small_grid_smem_size, stream>>>(params);
+      FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+    constexpr size_t decode_smem_size =
+        Sm80Fp8CompactDecodeTraits::kSmemSize -
+        Sm80Fp8CompactDecodeTraits::kBlockN *
+            Sm80Fp8CompactDecodeTraits::kHeadDim +
+        2 * 256 * sizeof(cutlass::bfloat16_t);
+    FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
+        flash_decode_sm80_fp8_kernel_prequantized_q,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, decode_smem_size));
+    flash_decode_sm80_fp8_kernel_prequantized_q<<<
+        dim3(1, params.b, params.h), Sm80Fp8CompactDecodeTraits::kNThreads,
+        decode_smem_size, stream>>>(params);
+    FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
+  constexpr size_t smem_size =
+      Sm80Fp8Traits::kSmemSize + 2 * 256 * sizeof(cutlass::bfloat16_t);
+  const dim3 grid(
+      (params.seqlen_q + Sm80Fp8Traits::kBlockM - 1) / Sm80Fp8Traits::kBlockM,
+      params.b, params.h);
+  if (smem_size >= 48 * 1024) {
+    FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
+        flash_fwd_sm80_fp8_kernel_prequantized_q,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  }
+  flash_fwd_sm80_fp8_kernel_prequantized_q<<<grid, Sm80Fp8Traits::kNThreads,
+                                             smem_size, stream>>>(params);
+  FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // Materialize each Q value and each referenced KV page once per prefill.
 // FP8 QDQ arithmetic is shared with the existing kernel, including signed zero.
 __global__ void stage_sm80_fp8_prefill_q(const Flash_fwd_sm80_fp8_params params,
@@ -207,22 +299,25 @@ __global__ __launch_bounds__(
 
 void run_mha_fwd_sm80_fp8_staged(const Flash_fwd_sm80_fp8_params& source,
                                  void* q, void* k, void* v, int* block_table,
-                                 int pages_per_sequence, cudaStream_t stream) {
-  const int64_t q_vectors = int64_t(source.total_q) * source.h * (256 / 8);
-  stage_sm80_fp8_prefill_q<<<(q_vectors + 127) / 128, 128, 0, stream>>>(
-      source, static_cast<cutlass::bfloat16_t*>(q));
-  FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+                                 int pages_per_sequence, cudaStream_t stream,
+                                 bool prequantized_q) {
+  if (!prequantized_q) {
+    const int64_t q_vectors = int64_t(source.total_q) * source.h * (256 / 8);
+    stage_sm80_fp8_prefill_q<<<(q_vectors + 127) / 128, 128, 0, stream>>>(
+        source, static_cast<cutlass::bfloat16_t*>(q));
+    FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   stage_sm80_fp8_prefill_kv<<<dim3(pages_per_sequence, source.b, source.h_k),
                               128, 0, stream>>>(
       source, static_cast<cutlass::bfloat16_t*>(k),
       static_cast<cutlass::bfloat16_t*>(v), block_table, pages_per_sequence);
   FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
   Flash_fwd_params params = source;
-  params.q_ptr = q;
+  params.q_ptr = prequantized_q ? source.q_ptr : q;
   params.k_ptr = k;
   params.v_ptr = v;
-  params.q_row_stride = params.h * 256;
-  params.q_head_stride = 256;
+  params.q_row_stride = prequantized_q ? source.q_row_stride : params.h * 256;
+  params.q_head_stride = prequantized_q ? source.q_head_stride : 256;
   params.k_batch_stride = params.v_batch_stride = 16 * params.h_k * 256;
   params.k_row_stride = params.v_row_stride = params.h_k * 256;
   params.k_head_stride = params.v_head_stride = 256;

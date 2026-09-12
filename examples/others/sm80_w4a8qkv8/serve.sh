@@ -10,7 +10,6 @@ fi
 model_path="$1"
 shift
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 IFS=, read -ra devices <<< "$CUDA_VISIBLE_DEVICES"
 for device in "${devices[@]}"; do

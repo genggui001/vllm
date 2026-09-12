@@ -472,6 +472,16 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             routing_tables=layer._expert_routing_tables(),
             **marlin_args,
         )
+        if getattr(layer, "_sm80_norm_qdq_prepared", False):
+            from vllm.model_executor.layers.fused_moe.experts import (
+                marlin_fp8_qdq_fused_moe,
+            )
+
+            experts = self.moe_kernel.fused_experts
+            assert isinstance(
+                experts, marlin_fp8_qdq_fused_moe.MarlinFp8QdqFusedExperts
+            )
+            experts.input_prequantized = True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Process weights using the shared oracle infrastructure

@@ -47,7 +47,8 @@ __forceinline__ __device__ float scaled_e4m3fn_qdq(float value, float scale) {
   return copysignf(fminf(quantized, 448.0f), normalized) * scale;
 }
 
-template <typename KernelTraits, typename Element, typename SmemTensor>
+template <bool PrequantizedQ, typename KernelTraits, typename Element,
+          typename SmemTensor>
 __forceinline__ __device__ void load_q_qdq(
     const Flash_fwd_sm80_fp8_params& params, const BlockInfo<true>& binfo,
     int bidh, int m_block, SmemTensor& sQ) {
@@ -64,7 +65,8 @@ __forceinline__ __device__ void load_q_qdq(
       binfo.q_offset(params.q_batch_stride, params.q_row_stride, blockIdx.y) +
       int64_t(m_block * kBlockM) * params.q_row_stride +
       int64_t(bidh) * params.q_head_stride;
-  const float scale = __ldg(params.q_scale_ptr);
+  float scale = 1.0f;
+  if constexpr (!PrequantizedQ) scale = __ldg(params.q_scale_ptr);
 
   for (int vec = threadIdx.x; vec < valid_rows * kVecsPerRow;
        vec += kNThreads) {
@@ -75,8 +77,12 @@ __forceinline__ __device__ void load_q_qdq(
     alignas(16) cutlass::Array<Element, kVec> q_qdq;
 #pragma unroll
     for (int i = 0; i < kVec; ++i) {
-      q_qdq[i] =
-          Element(scaled_e4m3fn_qdq(static_cast<float>(values[i]), scale));
+      if constexpr (PrequantizedQ) {
+        q_qdq[i] = values[i];
+      } else {
+        q_qdq[i] =
+            Element(scaled_e4m3fn_qdq(static_cast<float>(values[i]), scale));
+      }
     }
     // Swizzle<3, 3, 3> only permutes 16-byte vectors.  Values within an
     // eight-BF16 vector remain contiguous, so evaluate the CuTe layout once
@@ -203,7 +209,7 @@ __forceinline__ __device__ void decode_shared_fp8(const uint8_t* raw,
 }
 
 template <typename KernelTraits, bool IsDecode = false, bool UseAsync = false,
-          bool CompactAsync = false>
+          bool CompactAsync = false, bool PrequantizedQ = false>
 inline __device__ void compute_attn_sm80_fp8(
     const Flash_fwd_sm80_fp8_params& params) {
   using Element = typename KernelTraits::Element;
@@ -315,7 +321,8 @@ inline __device__ void compute_attn_sm80_fp8(
     v_lookup[bits] =
         Element(decode_e4m3fn(static_cast<uint8_t>(bits)) * v_scale);
   }
-  load_q_qdq<KernelTraits, Element>(params, binfo, bidh, m_block, sQ);
+  load_q_qdq<PrequantizedQ, KernelTraits, Element>(params, binfo, bidh, m_block,
+                                                   sQ);
   __syncthreads();
 
   typename KernelTraits::TiledMma tiled_mma;

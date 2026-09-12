@@ -246,15 +246,36 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
             raise TypeError(f"Expected uint8 KV cache, got {kv_cache.dtype}")
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        if num_actual_tokens < output.shape[0]:
+            output[num_actual_tokens:].zero_()
+        # Packed single-token GQA writes every physical row, including the
+        # zero-KV dummy sequences used by full Decode graphs. Other captured
+        # layouts need initialization because device query lengths can shrink.
+        packed_decode = (
+            not attn_metadata.use_cascade
+            and attn_metadata.max_query_len == 1
+            and num_actual_tokens == attn_metadata.query_start_loc.numel() - 1
+            and query.shape[1] > self.num_kv_heads
+        )
+        if not packed_decode and torch.cuda.is_current_stream_capturing():
+            output[:num_actual_tokens].zero_()
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
+
+        prequantized_q = getattr(layer, "_qrope_prequantized_q", False)
+        if prequantized_q:
+            fwd = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_prequantized_q
+            fwd_lse = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse_prequantized_q
+        else:
+            fwd = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd
+            fwd_lse = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse
 
         query = query[:num_actual_tokens]
         actual_output = output[:num_actual_tokens]
 
         if not attn_metadata.use_cascade:
-            torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd(
+            fwd(
                 query,
                 key_cache,
                 value_cache,
@@ -299,7 +320,7 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
         )
         prefix_output = torch.empty_like(query)
         suffix_output = torch.empty_like(query)
-        prefix_output, prefix_lse = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
+        prefix_output, prefix_lse = fwd_lse(
             query,
             key_cache,
             value_cache,
@@ -315,7 +336,7 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
             self.scale,
             False,
         )
-        suffix_output, suffix_lse = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
+        suffix_output, suffix_lse = fwd_lse(
             query,
             key_cache,
             value_cache,

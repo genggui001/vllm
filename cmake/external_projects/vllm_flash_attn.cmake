@@ -62,6 +62,11 @@ message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 # stock _vllm_fa2_C implementation and dispatch remain untouched.
 set(VLLM_FA2_SM80_FP8_DIR
   "${CMAKE_SOURCE_DIR}/csrc/attention/fa2_sm80_fp8")
+include(${CMAKE_SOURCE_DIR}/cmake/patches/sm80_fa2_lse.cmake)
+set(VLLM_FA2_SM80_FP8_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/sm80_fa2_include")
+sm80_configure_fa2_lse_header(
+  "${vllm-flash-attn_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_kernel.h"
+  "${VLLM_FA2_SM80_FP8_INCLUDE_DIR}/flash_fwd_kernel.h")
 set(VLLM_FA2_SM80_FP8_CUDA_SRC
   "${VLLM_FA2_SM80_FP8_DIR}/flash_fwd_sm80_fp8.cu")
 set(VLLM_FA2_SM80_FP8_SRC
@@ -92,6 +97,7 @@ define_gpu_extension_target(
   WITH_SOABI)
 target_include_directories(_vllm_fa2_sm80_fp8_C PRIVATE
   ${VLLM_FA2_SM80_FP8_DIR}
+  ${VLLM_FA2_SM80_FP8_INCLUDE_DIR}
   ${vllm-flash-attn_SOURCE_DIR}/csrc/flash_attn
   ${vllm-flash-attn_SOURCE_DIR}/csrc/flash_attn/src
   ${vllm-flash-attn_SOURCE_DIR}/csrc/common

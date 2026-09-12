@@ -175,3 +175,44 @@ def test_fused_qdq_preserves_negative_zero(dtype):
     actual = fp8_e4m3_per_token_qdq_fused(x)
     expected = fp8_e4m3_per_token_qdq(x)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "rows,block", [(0, 16), (128, 16), (513, 16), (1024, 48), (2048, 64), (2049, 16)]
+)
+def test_prepared_routing_preserves_input_bits_and_expert_token_mapping(
+    dtype, id_dtype, rows, block
+):
+    """Sorting may permute tokens within an expert; it must not re-quantize them."""
+    _require_sm80()
+    from vllm.model_executor.layers.fused_moe.experts.marlin_fp8_qdq_fused_moe import (
+        fp8_e4m3_qdq_align_prepared,
+    )
+
+    torch.manual_seed(728)
+    hidden = torch.randn((rows, 2048), device="cuda", dtype=dtype)
+    saved = hidden.clone()
+    ids = torch.randint(-1, 257, (rows, 8), device="cuda", dtype=id_dtype)
+    saved_ids = ids.clone()
+    result, sorted_ids, experts, total = fp8_e4m3_qdq_align_prepared(
+        hidden, ids, block, 256
+    )
+    assert result.data_ptr() == hidden.data_ptr()
+    assert torch.equal(result.view(torch.int16), saved.view(torch.int16))
+    assert torch.equal(ids, saved_ids)
+    count = total.item()
+    positions = sorted_ids[:count].long()
+    owner = experts[: count // block].repeat_interleave(block).long()
+    valid = positions < ids.numel()
+    actual = torch.sort(owner[valid] * (ids.numel() + 1) + positions[valid]).values
+    flat = ids.flatten().long()
+    valid_ids = (flat >= 0) & (flat < 256)
+    expected = torch.sort(
+        flat[valid_ids] * (ids.numel() + 1)
+        + torch.arange(ids.numel(), device="cuda")[valid_ids]
+    ).values
+    assert torch.equal(actual, expected)
+    counts = torch.bincount(flat[valid_ids], minlength=256)
+    assert count == int(((counts + block - 1) // block * block).sum())

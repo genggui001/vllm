@@ -279,6 +279,14 @@ class MoERunner(MoERunnerInterface):
                 moe_config=moe_config,
                 enable_dbo=enable_dbo,
                 mk_can_overlap_shared_experts=can_overlap,
+                enable_sm80_prefill_overlap=(
+                    current_platform.is_cuda()
+                    and current_platform.is_device_capability(80)
+                    and getattr(
+                        getattr(self._quant_method, "experts_cls", None), "__name__", ""
+                    )
+                    == "MarlinFp8QdqFusedExperts"
+                ),
             )
 
         # Needed for string -> MoERunner layer lookup in custom ops.
@@ -860,7 +868,12 @@ class MoERunner(MoERunnerInterface):
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
-                router_logits, _ = self.gate(hidden_states)
+                gate_input = (
+                    router_logits
+                    if getattr(self, "_sm80_input_prepared", False)
+                    else hidden_states
+                )
+                router_logits, _ = self.gate(gate_input)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

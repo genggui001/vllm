@@ -3,7 +3,19 @@
 This branch adds `FLASH_ATTN_QKV_FP8_SM80_FUSED` attention and
 `marlin_fp8_qdq_fused` experts to vLLM 0.28.0. It retains the measured Prefill
 staging implementation, adaptive Decode kernels, incremental block-table
-uploads, and optional exact 2048-token CUDA graphs.
+uploads, and optional exact 2048-token CUDA graphs. The native-prepared release
+also fuses Gemma residual RMSNorm with expert input QDQ and QK norm/MRoPE with
+query QDQ for the supported Qwen3.5 layout. Already prepared expert inputs use
+native CUDA routing for 513–2047 tokens; the exact 2048-token path retains the
+measured prewarmed routing kernels. Other shapes keep the general fallback.
+The shared-expert stream is additionally used at exactly 2048 tokens only by
+this custom MoE backend. SM80 GDN chunk configurations are pinned for the
+validated BF16 layout to avoid autotuning-dependent accumulation differences.
+The staged FA2 empty-KV LSE indexing fix is applied only to the custom target.
+
+Neither the backend nor the launch script sets `OMP_NUM_THREADS`. For example,
+`OMP_NUM_THREADS=1 bash serve.sh /path/to/model` explicitly requests one thread;
+leaving it unset retains upstream vLLM runtime and weight-loading policies.
 
 On A100, W4A8 means W4 weights with QAT-compatible E4M3 activation
 quantize/dequantize before each expert GEMM. The GEMMs still execute through
@@ -26,7 +38,7 @@ Q/K/V scales, and computes FA2 attention in BF16.
 `compilation.json` retains the original graph capture order and adds exactly
 2048 tokens. Batches above 512 that lack an exact graph keep their unpadded
 shape. The extra graph is opt-in; generic vLLM graph defaults are unchanged.
-Prefill stages Q/K/V only when the longest query is at least 64 tokens and
+Prefill stages Q/K/V only when the longest query exceeds 16 tokens and
 the calculated temporary storage fits 256 MiB. Other shapes use the existing
 Decode/fallback kernels. The persistent cache remains FP8 in both paths.
 
