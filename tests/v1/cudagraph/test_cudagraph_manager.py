@@ -172,10 +172,12 @@ def _create_decode_vllm_config(
     capture_sizes: list[int],
     num_speculative_tokens: int = 0,
     dynamic_spec_schedule: list[tuple[int, int, int]] | None = None,
+    padding_limit: int | None = None,
 ) -> MagicMock:
     compilation_config = CompilationConfig(
         cudagraph_mode="FULL_AND_PIECEWISE",
         cudagraph_capture_sizes=capture_sizes,
+        cudagraph_max_padding_size=padding_limit,
     )
     compilation_config.max_cudagraph_capture_size = capture_sizes[-1]
     compilation_config.post_init_cudagraph_sizes()
@@ -201,6 +203,7 @@ def _make_spec_decode_manager(
     capture_sizes: list[int] | None = None,
     num_speculative_tokens: int = 0,
     dynamic_spec_schedule: list[tuple[int, int, int]] | None = None,
+    padding_limit: int | None = None,
 ) -> gpu_cudagraph_utils.CudaGraphManager:
     monkeypatch.setattr(
         gpu_cudagraph_utils,
@@ -217,6 +220,7 @@ def _make_spec_decode_manager(
             capture_sizes or [1, 2, 4, 8, 16, 24],
             num_speculative_tokens=num_speculative_tokens,
             dynamic_spec_schedule=dynamic_spec_schedule,
+            padding_limit=padding_limit,
         ),
         device=torch.device("cpu"),
         cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -224,6 +228,27 @@ def _make_spec_decode_manager(
     )
     manager._graphs_captured = True
     return manager
+
+
+@pytest.mark.parametrize("padding_limit", [None, 512])
+def test_large_graph_padding_policy_preserves_decode(monkeypatch, padding_limit):
+    """V2 must preserve short decode padding and avoid expanding prefill tails."""
+    manager = _make_spec_decode_manager(
+        monkeypatch,
+        decode_query_len=1,
+        capture_sizes=[1, 2, 4, 8, 512, 2048],
+        padding_limit=padding_limit,
+    )
+    desc = manager.dispatch(7, 7, uniform_token_count=1, num_active_loras=0)
+    assert (desc.cg_mode, desc.num_tokens) == (CUDAGraphMode.FULL, 8)
+    desc = manager.dispatch(2, 2048, uniform_token_count=None, num_active_loras=0)
+    assert (desc.cg_mode, desc.num_tokens) == (CUDAGraphMode.PIECEWISE, 2048)
+    for tokens in [513, 1042, 2047]:
+        desc = manager.dispatch(2, tokens, uniform_token_count=None, num_active_loras=0)
+        assert desc.cg_mode == (
+            CUDAGraphMode.NONE if padding_limit == 512 else CUDAGraphMode.PIECEWISE
+        )
+        assert desc.num_tokens == (tokens if padding_limit == 512 else 2048)
 
 
 def test_uniform_decode_pads_up_to_full_graph(monkeypatch):

@@ -584,6 +584,47 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     @classmethod
+    def _is_fp8_w4a8_sm80(
+        cls, weight_quant: QuantizationArgs | None, input_quant: QuantizationArgs | None
+    ) -> bool:
+        if not current_platform.is_cuda() or not cls._check_scheme_supported(
+            80, error=False, match_exact=True
+        ):
+            return False
+        if weight_quant is None or input_quant is None:
+            return False
+        return (
+            cls._is_fp8_w4a8(weight_quant, input_quant)
+            and weight_quant.type == QuantizationType.INT
+            and weight_quant.group_size == 128
+            and weight_quant.actorder is None
+            and input_quant.type == QuantizationType.FLOAT
+            and input_quant.group_size is None
+            and input_quant.block_structure is None
+            and input_quant.actorder is None
+        )
+
+    def uses_sm80_fp8_qkv(self) -> bool:
+        """Whether this checkpoint requests the calibrated SM80 W4A8/QKV8 path."""
+        kv = self.kv_cache_scheme
+        if not kv or not (
+            kv.get("type") == "float"
+            and kv.get("num_bits") == 8
+            and kv.get("strategy") == "tensor"
+            and kv.get("symmetric")
+            and not kv.get("dynamic", False)
+        ):
+            return False
+        return any(
+            scheme is not None
+            and scheme.get("format") == CompressionFormat.pack_quantized.value
+            and self._is_fp8_w4a8_sm80(
+                scheme.get("weights"), scheme.get("input_activations")
+            )
+            for scheme in self.target_scheme_map.values()
+        )
+
+    @classmethod
     def _is_fp8_w4a8_sm90(
         cls, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:

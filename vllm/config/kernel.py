@@ -134,6 +134,7 @@ MoEBackend = Literal[
     "flashinfer_moe_ep_mega_deep_gemm",
     "flashinfer_moe_ep_mega_cutedsl",
     "marlin",
+    "marlin_fp8_qdq_fused",
     "humming",
     "triton_unfused",
     "aiter",
@@ -257,6 +258,8 @@ class KernelConfig:
       an NVFP4 checkpoint is consumed prequantized, MXFP4 weights are
       requantized at load
     - "marlin": Use Marlin kernels (weight-only quantization)
+    - "marlin_fp8_qdq_fused": Use Marlin WNA16 GEMMs with QAT-compatible
+      dynamic per-token E4M3 QDQ. SwiGLU and FC2-input QDQ share a Triton kernel.
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
     - "aiter": Use AMD AITer kernels (ROCm only)

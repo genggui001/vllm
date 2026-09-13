@@ -1016,6 +1016,7 @@ class precompiled_wheel_utils:
                             "vllm/_flashkda_C.abi3.so",
                             "vllm/_sparse_flashmla_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+                            "vllm/vllm_flash_attn/_vllm_fa2_sm80_fp8_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
                             "vllm/cumem_allocator.abi3.so",
                             "vllm/spinloop.abi3.so",
@@ -1361,6 +1362,7 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_sm80_fp8_C"))
     if USE_PRECOMPILED_EXTENSIONS or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):

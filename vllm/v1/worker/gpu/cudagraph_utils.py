@@ -305,6 +305,9 @@ class CudaGraphManager:
                 # num_tokens. Group them so each graph covers the same candidate range.
                 for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
                     matching = list(group)
+                    padding_limit = self.compilation_config.cudagraph_max_padding_size
+                    if padding_limit is not None and num_tokens > padding_limit:
+                        current_range_start = num_tokens
                     for i in range(current_range_start, num_tokens + 1):
                         key = (i, num_active_loras)
                         self._candidates.setdefault(key, []).extend(matching)

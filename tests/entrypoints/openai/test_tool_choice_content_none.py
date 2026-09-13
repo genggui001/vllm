@@ -201,3 +201,34 @@ def test_chat_completion_stream_response_keeps_non_empty_tool_calls_payload():
 
     assert len(delta["tool_calls"]) == 1
     assert delta["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("reasoning", [None, "", "step 1\n推理"])
+def test_reasoning_content_alias_in_chat_response_json(streaming, reasoning):
+    import json
+
+    if streaming:
+        response = _stream_response(DeltaMessage(reasoning=reasoning))
+        key = "delta"
+    else:
+        response = _chat_response(ChatMessage(role="assistant", reasoning=reasoning))
+        key = "message"
+    payload = json.loads(response.model_dump_json(exclude_unset=True))
+    message = payload["choices"][0][key]
+    assert message["reasoning"] == reasoning
+    if reasoning is None:
+        assert "reasoning_content" not in message
+    else:
+        assert message["reasoning_content"] == reasoning
+    assert "tool_calls" not in message
+
+
+@pytest.mark.parametrize("message_cls", [ChatMessage, DeltaMessage])
+def test_reasoning_alias_keeps_explicit_existing_extra(message_cls):
+    message = message_cls(
+        role="assistant", reasoning="canonical", reasoning_content="existing"
+    )
+    payload = message.model_dump()
+    assert payload["reasoning"] == "canonical"
+    assert payload["reasoning_content"] == "existing"

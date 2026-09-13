@@ -21,6 +21,35 @@ NUM_WARPS = [2, 4, 8, 16]
 _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
 
 
+def _sm80_gdn_h_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    k = args["k"]
+    initial = args["h0"]
+    supported = (
+        k.is_cuda
+        and k.dtype == torch.bfloat16
+        and args["v"].dtype == args["w"].dtype == torch.bfloat16
+        and (initial is None or initial.dtype == torch.float32)
+        and (args["H"], args["Hg"], args["K"], args["V"], args["BT"])
+        == (16, 8, 128, 128, 64)
+        and args["IS_VARLEN"]
+        and args["USE_G"]
+        and not args["USE_GK"]
+        and args["STORE_FINAL_STATE"]
+        and args["SAVE_NEW_VALUE"]
+        and torch.cuda.get_device_capability(k.device) == (8, 0)
+    )
+    if supported:
+        selected = [
+            c
+            for c in configs
+            if c.kwargs["BV"] == 32 and c.num_warps == 4 and c.num_stages == 4
+        ]
+        assert len(selected) == 1
+        return selected
+    return configs
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -38,7 +67,19 @@ _CHUNK_DELTA_H_NUM_STAGES = [2, 3] if torch.version.hip else [2, 3, 4]
         for num_stages in _CHUNK_DELTA_H_NUM_STAGES
         for BV in [32, 64]
     ],
-    key=["H", "K", "V", "BT"],
+    key=[
+        "H",
+        "Hg",
+        "K",
+        "V",
+        "BT",
+        "USE_G",
+        "USE_GK",
+        "IS_VARLEN",
+        "STORE_FINAL_STATE",
+        "SAVE_NEW_VALUE",
+    ],
+    prune_configs_by={"early_config_prune": _sm80_gdn_h_configs},
     use_cuda_graph=use_cuda_graph,
 )
 @triton.jit(do_not_specialize=["T"])

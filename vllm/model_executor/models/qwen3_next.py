@@ -17,6 +17,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -24,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
     resolve_layer_fused_shared_expert,
 )
 from vllm.model_executor.layers.fused_qk_norm_rope import fused_qk_rmsnorm_rope_gate
+from vllm.model_executor.layers.gemma_norm_fp8_qdq import norm_qdq_deferred_op
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3NextRMSNorm,
 )
@@ -42,6 +44,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.qknorm_mrope_fp8_qdq import qknorm_mrope_qdq
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
@@ -77,6 +80,8 @@ from .utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -238,6 +243,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
+        prepared_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
@@ -252,9 +258,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             if self.replicate_shared_expert and self.shared_expert is not None
             else None
         )
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=hidden_states
-        )
+        if prepared_hidden_states is not None:
+            assert not self.is_sequence_parallel
+            final_hidden_states = self.experts(
+                hidden_states=prepared_hidden_states,
+                router_logits=hidden_states,
+                shared_experts_input=hidden_states,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
         if replicated_shared_output is not None:
             final_hidden_states += replicated_shared_output
 
@@ -381,6 +395,27 @@ class Qwen3NextAttention(nn.Module):
             and (text_only or supports_mrope)
         )
 
+        # Prefer the calibrated SM80 fusion for its supported layout.
+        self.use_qknorm_mrope_qdq = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(80)
+            and self.attn_output_gate
+            and self.rotary_emb.__class__.__name__ == "MRotaryEmbedding"
+            and not self.rotary_emb.enabled()
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == 64
+            and tuple(self.rotary_emb.mrope_section) == (11, 11, 10)
+            and self.head_dim == 256
+            and self.num_heads == 8
+            and self.num_kv_heads == 4
+            and self.attn.impl.__class__.__name__ == "FlashAttentionQkvFp8Sm80FusedImpl"
+            and getattr(model_config, "dtype", None) == torch.bfloat16
+            and self.attn.query_quant is None
+        )
+        if self.use_qknorm_mrope_qdq:
+            self.attn._qrope_prequantized_q = True
+            logger.info_once("Using SM80 fused QK norm, MRoPE and query FP8 QDQ")
+
     def _project_qkv_gate(
         self,
         qkv: torch.Tensor,
@@ -392,6 +427,20 @@ class Qwen3NextAttention(nn.Module):
         split + QK-RMSNorm + RoPE path. ``gate`` is ``None`` when output
         gating is disabled.
         """
+        if self.use_qknorm_mrope_qdq:
+            return qknorm_mrope_qdq(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                positions,
+                self.rotary_emb._match_cos_sin_cache_dtype(qkv),
+                self.attn._q_scale,
+                eps=self.q_norm.variance_epsilon,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                sections=tuple(self.rotary_emb.mrope_section),
+                interleaved=self.rotary_emb.mrope_interleaved,
+            )
         if self.use_fused_qk_norm_rope_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -591,14 +640,29 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if self.use_attn_reduce_scatter_for_moe:
-            hidden_states = self.mlp(
+        if getattr(self, "_sm80_norm_qdq", False):
+            normalized, prepared = norm_qdq_deferred_op(
                 hidden_states,
-                already_sequence_parallel=True,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
             )
+            residual = (hidden_states.float() + residual.float()).to(
+                hidden_states.dtype
+            )
+            hidden_states = normalized
+            hidden_states = self.mlp(hidden_states, prepared_hidden_states=prepared)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            if self.use_attn_reduce_scatter_for_moe:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    already_sequence_parallel=True,
+                )
+            else:
+                hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:

@@ -115,6 +115,8 @@ class BlockTable:
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
+        self._dirty_rows = np.zeros(max_num_reqs, dtype=np.bool_)
+        self._cpu_view_exposed = False
 
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
@@ -171,6 +173,7 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+        self._dirty_rows[row_idx] = True
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -180,6 +183,7 @@ class BlockTable:
         num_blocks = self.num_blocks_per_row[row_idx]
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
+            self._dirty_rows[row_idx] = True
         self.num_blocks_per_row[row_idx] = 0
 
     def move_row(self, src: int, tgt: int) -> None:
@@ -192,11 +196,13 @@ class BlockTable:
         # after the blocks have been freed and reallocated.
         block_table_np[src, :num_blocks] = 0
         self.num_blocks_per_row[src] = 0
+        self._dirty_rows[[src, tgt]] = True
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
+        self._dirty_rows[src_tgt] = True
 
     def compute_slot_mapping(
         self,
@@ -229,11 +235,25 @@ class BlockTable:
         )
 
     def commit_block_table(self, num_reqs: int) -> None:
-        self.block_table.copy_to_gpu(num_reqs)
+        if not self.use_hybrid_blocks or self._cpu_view_exposed:
+            self.block_table.copy_to_gpu(num_reqs)
+            return
+
+        # Virtual block expansion can make each row very wide. Decode usually
+        # reuses the same pages, so only transfer rows changed on the CPU.
+        dirty = np.flatnonzero(self._dirty_rows[:num_reqs])
+        if dirty.size == 0:
+            return
+        start, end = int(dirty[0]), int(dirty[-1]) + 1
+        self.block_table.gpu[start:end].copy_(
+            self.block_table.cpu[start:end], non_blocking=True
+        )
+        self._dirty_rows[start:end] = False
 
     def clear(self) -> None:
         self.block_table.gpu.fill_(0)
         self.block_table.cpu.fill_(0)
+        self._dirty_rows.fill(False)
 
     @staticmethod
     def map_to_kernel_blocks(
@@ -271,10 +291,13 @@ class BlockTable:
 
     def get_cpu_tensor(self) -> torch.Tensor:
         """Returns the CPU tensor of the block table."""
+        # A caller can retain and mutate this view after any commit.
+        self._cpu_view_exposed = True
         return self.block_table.cpu
 
     def get_numpy_array(self) -> np.ndarray:
         """Returns the numpy array of the block table."""
+        self._cpu_view_exposed = True
         return self.block_table.np
 
     def _make_buffer(

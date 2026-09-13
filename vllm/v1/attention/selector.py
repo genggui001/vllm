@@ -8,14 +8,18 @@ import torch
 
 import vllm.envs as envs
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.registry import (
+    AttentionBackendEnum,
     MambaAttentionBackendEnum,
 )
 
 if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpecKind
+
+logger = init_logger(__name__)
 
 
 class AttentionSelectorConfig(NamedTuple):
@@ -181,6 +185,24 @@ def get_attn_backend(
             attn_type=attn_type,
         )
         backend = attention_config.backend_per_kind.get(kind.value, backend)
+
+    if backend is None and kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        quant_config = vllm_config.quant_config
+        if quant_config is not None and quant_config.get_name() == "compressed-tensors":
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+                CompressedTensorsConfig,
+            )
+
+            if (
+                isinstance(quant_config, CompressedTensorsConfig)
+                and quant_config.uses_sm80_fp8_qkv()
+                and not use_mla
+            ):
+                backend = AttentionBackendEnum.FLASH_ATTN_QKV_FP8_SM80_FUSED
+                logger.info_once(
+                    "Automatically selecting %s for SM80 W4A8 with FP8 KV cache.",
+                    backend.name,
+                )
 
     # The KV cache layout is resolved across all of the model's backends at once
     # in get_kv_cache_spec(); a single selection cannot see its peers.

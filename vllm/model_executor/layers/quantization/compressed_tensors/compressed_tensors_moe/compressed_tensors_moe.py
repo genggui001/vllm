@@ -73,7 +73,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
             return CompressedTensorsW8A8Mxfp8MoEMethod(layer.moe_config)
 
-        if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
+        use_sm80_fp8_qdq = quant_config._is_fp8_w4a8_sm80(weight_quant, input_quant)
+        if (
+            quant_config._is_wNa16_group_channel(weight_quant, input_quant)
+            or use_sm80_fp8_qdq
+        ):
             valid_format_and_bits = (
                 weight_quant.num_bits in WNA16_SUPPORTED_BITS
                 and format == CompressionFormat.pack_quantized.value
@@ -134,6 +138,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 weight_quant,
                 input_quant,
                 layer.moe_config,
+                use_fp8_qdq=use_sm80_fp8_qdq,
             )
         elif quant_config._is_nvfp4_format(weight_quant):
             from .compressed_tensors_moe_w4a4_nvfp4 import (

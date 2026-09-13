@@ -54,6 +54,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
@@ -185,6 +186,26 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.post_attention_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        method = self.mlp.experts.routed_experts.quant_method if is_moe_layer else None
+        self._sm80_norm_qdq = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(80)
+            and is_moe_layer
+            and config.hidden_size == 2048
+            and config.rms_norm_eps == 1e-6
+            and model_config.dtype == torch.bfloat16
+            and not parallel_config.use_sequence_parallel_moe
+            and not parallel_config.enable_expert_parallel
+            and vllm_config.lora_config is None
+            and getattr(getattr(method, "experts_cls", None), "__name__", "")
+            == "MarlinFp8QdqFusedExperts"
+        )
+        if self._sm80_norm_qdq:
+            self.mlp.experts._sm80_input_prepared = True
+            self.mlp.experts.routed_experts._sm80_norm_qdq_prepared = True
+            logger.info_once(
+                "Using SM80 fused Gemma residual RMSNorm and expert FP8 QDQ"
+            )
 
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:

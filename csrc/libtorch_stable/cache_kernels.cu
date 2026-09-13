@@ -865,6 +865,15 @@ void reshape_and_cache_flash(
 
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
+#ifndef USE_ROCM
+  if (kv_cache_dtype == "fp8_e4m3" && head_stride != head_size) {
+    const auto* props = get_device_prop();
+    if (props->major == 8 && props->minor == 0) {
+      // The HND path assigns one head per warp. Extra warps do no work.
+      block.x = std::min(num_heads * 32, 512);
+    }
+  }
+#endif
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);

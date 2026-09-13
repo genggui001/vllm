@@ -265,6 +265,7 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
+    input_preparation: Callable[..., tuple[torch.Tensor, ...]] | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -337,13 +338,20 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-    )
+    if input_preparation is None:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
+    else:
+        hidden_states, sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            input_preparation(
+                hidden_states, topk_ids, block_size_m, global_num_experts, expert_map
+            )
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -733,6 +741,22 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
 
         return (workspace1, workspace2, output)
 
+    def prepare_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        block_size: int,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return hidden_states, *moe_align_block_size(
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
+
     def apply(
         self,
         output: torch.Tensor,
@@ -777,6 +801,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 global_num_experts=global_num_experts,
                 activation=activation,
                 activation_func=self.activation,
+                input_preparation=self.prepare_inputs,
                 activation_config=self.activation_config,
                 moe_sum=self.moe_sum,
                 expert_map=expert_map,
