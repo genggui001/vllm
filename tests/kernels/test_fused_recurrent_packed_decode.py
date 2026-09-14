@@ -13,15 +13,15 @@ from vllm.third_party.flash_linear_attention.ops import (
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA device")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("strided_mixed_qkv", [False, True])
+@pytest.mark.parametrize(
+    "B,H,HV", [(32, 4, 8), (1, 8, 16), (2, 8, 16), (8, 8, 16), (9, 8, 16)]
+)
 def test_fused_recurrent_packed_decode_matches_reference(
-    dtype: torch.dtype, strided_mixed_qkv: bool
+    dtype: torch.dtype, strided_mixed_qkv: bool, B: int, H: int, HV: int
 ):
     torch.manual_seed(0)
 
     # Small but representative GDN config (Qwen3Next defaults are K=128, V=128).
-    B = 32
-    H = 4
-    HV = 8  # grouped value attention: HV must be divisible by H
     K = 128
     V = 128
     qkv_dim = 2 * (H * K) + (HV * V)
@@ -44,7 +44,8 @@ def test_fused_recurrent_packed_decode_matches_reference(
     # Continuous batching indices (include PAD_SLOT_ID=-1 cases). Index 0 is
     # reserved as NULL_BLOCK_ID (CUDA graph padding), so valid slots start at 1.
     ssm_state_indices = torch.arange(1, B + 1, device=device, dtype=torch.int32)
-    ssm_state_indices[-3:] = -1
+    if B > 1:
+        ssm_state_indices[-min(3, B // 2) :] = -1
 
     state0 = torch.randn((B + 1, HV, V, K), device=device, dtype=dtype)
     state_ref = state0.clone()

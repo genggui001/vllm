@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for v1 attention backends without GPUModelRunner dependency."""
 
+import math
 from functools import partial
 
 import pytest
@@ -715,6 +716,240 @@ def test_causal_backend_correctness(
             tensor_parallel_size=tensor_parallel_size,
             kv_cache_dtype=kv_cache_dtype,
         )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="Native SM89 FP8 attention requires compute capability 8.9",
+)
+@pytest.mark.parametrize(
+    "batch_name", ["small_decode", "medium_decode", "mixed_medium", "single_prefill"]
+)
+def test_sm89_native_fp8_metadata_and_cache_update(
+    default_vllm_config, tmp_path, batch_name
+):
+    """Exercise the public backend with real metadata and CUDA KV writes."""
+    from transformers import LlamaConfig
+
+    # A local config avoids a gated model download; no weights are loaded.
+    config = LlamaConfig(
+        hidden_size=2048,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        head_dim=256,
+        vocab_size=128,
+        architectures=["LlamaForCausalLM"],
+        dtype="bfloat16",
+    )
+    config.save_pretrained(tmp_path)
+
+    def causal_mask(b, h, q_idx, kv_idx, *, context_len):
+        return q_idx + context_len >= kv_idx
+
+    _test_backend_correctness(
+        BATCH_SPECS[batch_name],
+        str(tmp_path),
+        [AttentionBackendEnum.FLASH_ATTN_FP8_SM89],
+        causal_mask,
+        kv_cache_dtype="fp8_e4m3",
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="Native SM89 FP8 attention requires compute capability 8.9",
+)
+@pytest.mark.parametrize("head_size,page_size", [(64, 16), (128, 528), (256, 528)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sm89_split_decode_uniform_attention_with_graph_padding(
+    head_size, page_size, dtype
+):
+    """Zero queries give a KV mean, including empty/split tails and graph padding."""
+    from vllm.v1.attention.ops.flash_attn_fp8_sm89 import sm89_fp8_paged_attention
+
+    device = "cuda"
+    heads, kv_heads, max_len = 8, 4, 1057
+    lengths = [0, 1, 129, 528, max_len]
+    pages_per_seq = cdiv(max_len, page_size)
+    num_pages = len(lengths) * pages_per_seq
+    raw = torch.randint(
+        -7, 8, (num_pages, page_size, kv_heads, 2 * head_size), device=device
+    ).to(torch.float8_e4m3fn)
+    cache = raw.transpose(1, 2)
+    table = torch.randperm(num_pages, device=device, dtype=torch.int32).view(
+        len(lengths), pages_per_seq
+    )
+    # The last request is CUDA-graph padding and must not read scratch output.
+    table = torch.cat((table, table[:1]), dim=0)
+    starts = torch.tensor([0, 1, 2, 3, 4, 5, 5], device=device, dtype=torch.int32)
+    seq_lens = torch.tensor(lengths + [0], device=device, dtype=torch.int32)
+    query = torch.zeros((5, heads, head_size), device=device).to(torch.float8_e4m3fn)
+    backing = torch.full((6, heads, head_size * 2), 13.0, device=device, dtype=dtype)
+    output = backing[:5, :, :head_size]
+    lse = torch.empty((5, heads), device=device, dtype=torch.float32)
+    scales = [torch.tensor(x, device=device) for x in (0.03125, 0.015625, 0.0625)]
+
+    def run():
+        sm89_fp8_paged_attention(
+            query,
+            cache,
+            output,
+            starts,
+            seq_lens,
+            table,
+            1,
+            head_size**-0.5,
+            *scales,
+            lse=lse,
+            max_seq_len=max_len,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for current in (lengths, [0, 129, 1, 529, 1025]):
+        seq_lens.copy_(torch.tensor(current + [0], device=device, dtype=torch.int32))
+        graph.replay()
+        assert torch.isfinite(output).all()
+        for seq, length in enumerate(current):
+            if length == 0:
+                assert torch.count_nonzero(output[seq]) == 0
+                assert torch.isneginf(lse[seq]).all()
+                continue
+            values = raw.float()[table[seq].long()].reshape(
+                -1, kv_heads, 2 * head_size
+            )[:length, :, head_size:]
+            expected = (values.mean(0) * scales[2]).repeat_interleave(
+                heads // kv_heads, dim=0
+            )
+            torch.testing.assert_close(
+                output[seq].float(), expected, rtol=0.008, atol=1e-5
+            )
+            torch.testing.assert_close(
+                lse[seq],
+                torch.full_like(lse[seq], math.log(length)),
+                atol=2e-6,
+                rtol=2e-6,
+            )
+        assert torch.all(backing[5] == 13)
+        assert torch.all(backing[:5, :, head_size:] == 13)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="Native SM89 FP8 attention requires compute capability 8.9",
+)
+@pytest.mark.parametrize(
+    "head_size,group_size,page_size",
+    [
+        (64, 1, 16),
+        (64, 3, 528),
+        (128, 2, 528),
+        (128, 8, 16),
+        (256, 16, 528),
+        (256, 32, 16),
+    ],
+)
+def test_sm89_decode_shared_kv_heads_preserve_bits(head_size, group_size, page_size):
+    """Packing heads into rows preserves the ungrouped FP8 recipe exactly."""
+    from vllm.v1.attention.ops.flash_attn_fp8_sm89 import (
+        _decode_num_splits,
+        _merge_fp8_splits,
+        _paged_fp8_fwd,
+        sm89_fp8_paged_attention,
+    )
+
+    torch.manual_seed(89)
+    heads, kv_heads, max_len = 2 * group_size, 2, 1057
+    pages_per_seq = cdiv(max_len, page_size)
+    raw = (
+        torch.randn(
+            (4 * pages_per_seq, page_size, kv_heads, 2 * head_size), device="cuda"
+        )
+        .mul_(24)
+        .to(torch.float8_e4m3fn)
+    )
+    cache = raw.transpose(1, 2)
+    table = torch.randperm(raw.shape[0], device="cuda", dtype=torch.int32).view(
+        4, pages_per_seq
+    )
+    starts = torch.tensor([0, 1, 1, 2, 3], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([129, 0, 529, max_len], device="cuda", dtype=torch.int32)
+    query = (
+        torch.randn((3, heads, head_size), device="cuda")
+        .mul_(24)
+        .to(torch.float8_e4m3fn)
+    )
+    storage = torch.full(
+        (4, heads, 2 * head_size), 13.0, device="cuda", dtype=torch.bfloat16
+    )
+    output = storage[:3, :, :head_size]
+    lse = torch.empty(query.shape[:2], device="cuda", dtype=torch.float32)
+    scales = [torch.tensor(x, device="cuda") for x in (0.03125, 0.015625, 0.0625)]
+    sm89_fp8_paged_attention(
+        query,
+        cache,
+        output,
+        starts,
+        lengths,
+        table,
+        1,
+        head_size**-0.5,
+        *scales,
+        lse=lse,
+        max_seq_len=max_len,
+    )
+    actual, actual_lse = output.clone(), lse.clone()
+    splits = _decode_num_splits(4, heads, max_len)
+    partial = torch.empty((3, heads, splits, head_size), device="cuda")
+    partial_lse = torch.empty((3, heads, splits), device="cuda")
+    _paged_fp8_fwd[(splits, heads, 4)](
+        query,
+        cache,
+        partial if splits > 1 else output,
+        partial_lse if splits > 1 else lse,
+        starts,
+        lengths,
+        table,
+        *scales,
+        *query.stride()[:2],
+        *cache.stride()[:3],
+        *output.stride()[:2],
+        table.stride(0),
+        heads,
+        kv_heads,
+        head_size,
+        page_size,
+        head_size**-0.5,
+        True,
+        16,
+        64,
+        splits,
+        False,
+        num_warps=4,
+        num_stages=2,
+    )
+    if splits > 1:
+        _merge_fp8_splits[(heads, 4)](
+            partial,
+            partial_lse,
+            output,
+            lse,
+            starts,
+            heads,
+            head_size,
+            splits,
+            *output.stride()[:2],
+            True,
+            num_warps=4,
+        )
+    assert torch.equal(actual.view(torch.uint8), output.view(torch.uint8))
+    assert torch.equal(actual_lse, lse)
+    assert torch.all(storage[3] == 13)
+    assert torch.all(storage[:3, :, head_size:] == 13)
 
 
 @pytest.mark.skipif(

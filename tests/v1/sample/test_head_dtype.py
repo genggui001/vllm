@@ -211,6 +211,105 @@ def test_get_top_tokens_honors_head_dtype(default_vllm_config):
     assert torch.equal(top, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_vocab_parallel_greedy_matches_full_argmax_edge_values(
+    default_vllm_config, monkeypatch, dtype
+):
+    """Ties, NaNs and infinities keep the first global ID on both ranks."""
+    from types import SimpleNamespace
+
+    full = torch.tensor(
+        [
+            [1, 2, 3, 4, 4, 3, 2, 1],
+            [-float("inf")] * 8,
+            [0, float("inf"), 1, 2, float("inf"), 0, 0, 0],
+            [0, float("nan"), 1, 2, float("nan"), 0, 0, 0],
+            [0, 1, 2, 3, 0, float("nan"), 0, 0],
+        ],
+        dtype=dtype,
+    )
+    hidden = torch.zeros(5, 4, dtype=dtype)
+    before = hidden.view(torch.uint8).clone()
+    local_pairs = []
+    for rank in range(2):
+        value, index = full[:, rank * 4 : (rank + 1) * 4].max(-1)
+        local_pairs.append(torch.stack((value.float(), (index + rank * 4).float()), -1))
+    for rank in range(2):
+        lp = _build_processor(8)
+        head = _FakeLmHead(
+            torch.empty(4, 4, dtype=dtype),
+            shard_indices=SimpleNamespace(
+                num_org_vocab_padding=0, org_vocab_start_index=rank * 4
+            ),
+        )
+        head.tp_size = 2
+        local = full[:, rank * 4 : (rank + 1) * 4].clone()
+        local_before = local.view(torch.uint8).clone()
+        monkeypatch.setattr(lp, "_apply_head", lambda *args, local=local: local)
+
+        def gather(pair, dim, rank=rank):
+            assert dim == -1
+            assert torch.equal(
+                pair.view(torch.uint8), local_pairs[rank].view(torch.uint8)
+            )
+            return torch.cat(local_pairs, -1)
+
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.logits_processor.tensor_model_parallel_all_gather",
+            gather,
+        )
+        actual = lp.get_top_tokens(head, hidden)
+        assert torch.equal(actual, full.float().argmax(-1))
+        assert torch.equal(local.view(torch.uint8), local_before)
+        assert torch.equal(hidden.view(torch.uint8), before)
+
+
+@pytest.mark.parametrize(
+    "change", [None, "padding", "added", "scale", "soft_cap", "head", "size"]
+)
+def test_qwen_moe_vocab_parallel_greedy_rejects_unsupported_head(
+    default_vllm_config, change
+):
+    """All ranks reject global padding and transforms before any collective."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
+
+    head = Mock(spec=ParallelLMHead)
+    head.tp_size = 2
+    head.quant_method = UnquantizedEmbeddingMethod()
+    head.weight = torch.empty(4, 4, dtype=torch.bfloat16)
+    head.org_vocab_size = head.org_vocab_size_padded = 8
+    head.shard_indices = SimpleNamespace(
+        num_added_elements_padded=0,
+        num_org_vocab_padding=0,
+        num_org_elements=4,
+        padded_org_vocab_start_index=0,
+        org_vocab_start_index=0,
+    )
+    processor = _build_processor(8)
+    if change == "padding":
+        # Even rank 0 with no local padding must reject a padded global vocab.
+        head.org_vocab_size_padded = 16
+    elif change == "added":
+        head.shard_indices.num_added_elements_padded = 8
+    elif change == "scale":
+        processor.scale = 0.5
+    elif change == "soft_cap":
+        processor.soft_cap = 30.0
+    elif change == "head":
+        head.quant_method = object()
+    elif change == "size":
+        head.org_vocab_size = head.org_vocab_size_padded = processor.org_vocab_size = (
+            2**24 + 1
+        )
+    model = SimpleNamespace(lm_head=head, logits_processor=processor)
+    assert Qwen3_5MoeForCausalLM.supports_vocab_parallel_greedy.fget(model) is (
+        change is None
+    )
+
+
 @pytest.mark.core_model
 def test_fp32_head_e2e_no_nan():
     """An fp32 head produces finite logprobs end-to-end.

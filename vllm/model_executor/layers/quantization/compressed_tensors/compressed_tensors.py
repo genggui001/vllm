@@ -584,6 +584,20 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     @classmethod
+    def _is_fp8_w4a8_sm89(
+        cls, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        return (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(89)
+            and cls._is_fp8_w4a8(weight_quant, input_quant)
+            and weight_quant.type == QuantizationType.INT
+            and input_quant.type == QuantizationType.FLOAT
+            and weight_quant.group_size == 128
+            and weight_quant.actorder is None
+        )
+
+    @classmethod
     def _is_fp8_w4a8_sm90(
         cls, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:

@@ -4,7 +4,8 @@
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.triton_utils import triton
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
 
 
@@ -101,6 +102,244 @@ def moe_align_block_size(
         expert_ids = expert_map[expert_ids]
 
     return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+@triton.jit
+def _small_stable_align_kernel(
+    IDS,
+    SORTED,
+    EXPERTS,
+    TOTAL,
+    PAIRS: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    SORT_SIZE: tl.constexpr,
+    FILL_SIZE: tl.constexpr,
+    EXPERT_FILL_SIZE: tl.constexpr,
+):
+    i = tl.arange(0, SORT_SIZE)
+    expert = tl.load(IDS + i, i < PAIRS, other=-1)
+    valid = (i < PAIRS) & (expert >= 0) & (expert < NUM_EXPERTS)
+    safe_expert = tl.where(valid, expert, 0).to(tl.int32)
+    counts = tl.histogram(safe_expert, NUM_EXPERTS, mask=valid)
+    raw_begin = tl.cumsum(counts) - counts
+    padded = tl.cdiv(counts, BLOCK) * BLOCK
+    padded_begin = tl.cumsum(padded) - padded
+    tl.store(TOTAL, tl.sum(padded, 0))
+
+    # Unique integer keys preserve flattened token order within each expert.
+    keys = tl.where(valid, safe_expert * SORT_SIZE + i, (NUM_EXPERTS + 1) * SORT_SIZE)
+    keys = tl.sort(keys, descending=False)
+    sorted_expert = keys // SORT_SIZE
+    sorted_token = keys % SORT_SIZE
+    valid_sorted = sorted_expert < NUM_EXPERTS
+    gather_expert = tl.minimum(sorted_expert, NUM_EXPERTS - 1)
+    within_expert = i - tl.gather(raw_begin, gather_expert, 0)
+    destination = tl.gather(padded_begin, gather_expert, 0) + within_expert
+
+    fill = tl.arange(0, FILL_SIZE)
+    tl.store(SORTED + fill, PAIRS, fill < CAPACITY)
+    blocks = tl.arange(0, EXPERT_FILL_SIZE)
+    tl.store(EXPERTS + blocks, -1, blocks < MAX_BLOCKS)
+    # Fill and scatter can address the same positions from different warps.
+    tl.debug_barrier()
+    tl.store(SORTED + destination, sorted_token, valid_sorted)
+    tl.store(
+        EXPERTS + destination // BLOCK,
+        sorted_expert,
+        valid_sorted & (within_expert % BLOCK == 0),
+    )
+
+
+@triton.jit
+def _tile_count_sort_fill(
+    IDS,
+    KEYS,
+    COUNTS,
+    SORTED,
+    EXPERT_IDS,
+    PAIRS: tl.constexpr,
+    TILES: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+    TILE: tl.constexpr,
+    E: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    lane = tl.arange(0, TILE)
+    flat = tile * TILE + lane
+    # Initialization finishes before the scatter kernel starts.
+    tl.store(SORTED + flat, PAIRS, flat < CAPACITY)
+    tl.store(EXPERT_IDS + flat, -1, flat < MAX_BLOCKS)
+    if tile < TILES:
+        expert = tl.load(IDS + flat, flat < PAIRS, other=-1)
+        valid = (flat < PAIRS) & (expert >= 0) & (expert < E)
+        safe = tl.where(valid, expert, 0).to(tl.int32)
+        counts = tl.histogram(safe, E, mask=valid)
+        e = tl.arange(0, E)
+        tl.store(COUNTS + tile * E + e, counts)
+        key = tl.where(valid, safe * TILE + lane, E * TILE)
+        key = tl.sort(key, descending=False)
+        tl.store(KEYS + flat, key)
+
+
+@triton.jit
+def _tile_prefix_scatter(
+    KEYS,
+    COUNTS,
+    SORTED,
+    EXPERT_IDS,
+    TOTAL,
+    TILES: tl.constexpr,
+    TILES_PAD: tl.constexpr,
+    E: tl.constexpr,
+    TILE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    all_tiles = tl.arange(0, TILES_PAD)
+    expert = tl.arange(0, E)
+    counts = tl.load(
+        COUNTS + all_tiles[:, None] * E + expert[None, :],
+        all_tiles[:, None] < TILES,
+        other=0,
+    )
+    totals = tl.sum(counts, axis=0)
+    preceding = tl.sum(tl.where(all_tiles[:, None] < tile, counts, 0), axis=0)
+    local_counts = tl.load(COUNTS + tile * E + expert)
+    raw_begin = tl.cumsum(local_counts, axis=0) - local_counts
+    padded = tl.cdiv(totals, BLOCK) * BLOCK
+    global_begin = tl.cumsum(padded, axis=0) - padded + preceding
+    if tile == 0:
+        tl.store(TOTAL, tl.sum(padded, axis=0))
+
+    lane = tl.arange(0, TILE)
+    key = tl.load(KEYS + tile * TILE + lane)
+    sorted_expert = key // TILE
+    original = key % TILE
+    valid = sorted_expert < E
+    safe = tl.minimum(sorted_expert, E - 1)
+    within_tile = lane - tl.gather(raw_begin, safe, axis=0)
+    destination = tl.gather(global_begin, safe, axis=0) + within_tile
+    tl.store(SORTED + destination, tile * TILE + original, valid)
+    tl.store(
+        EXPERT_IDS + destination // BLOCK,
+        sorted_expert,
+        valid & (destination % BLOCK == 0),
+    )
+
+
+def _large_stable_align(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int, pad_sorted_ids: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pairs = topk_ids.numel()
+    capacity = pairs + num_experts * (block_size - 1)
+    if pad_sorted_ids:
+        capacity = triton.cdiv(capacity, block_size) * block_size
+    blocks = triton.cdiv(capacity, block_size)
+    tile = 256
+    tiles = triton.cdiv(pairs, tile)
+    options = dict(dtype=torch.int32, device=topk_ids.device)
+    sorted_ids = torch.empty((capacity,), **options)
+    expert_ids = torch.empty((blocks,), **options)
+    total = torch.empty((1,), **options)
+    keys = torch.empty((tiles, tile), **options)
+    counts = torch.empty((tiles, num_experts), **options)
+    _tile_count_sort_fill[(triton.cdiv(capacity, tile),)](
+        topk_ids,
+        keys,
+        counts,
+        sorted_ids,
+        expert_ids,
+        pairs,
+        tiles,
+        capacity,
+        blocks,
+        tile,
+        num_experts,
+        num_warps=4,
+    )
+    _tile_prefix_scatter[(tiles,)](
+        keys,
+        counts,
+        sorted_ids,
+        expert_ids,
+        total,
+        tiles,
+        triton.next_power_of_2(tiles),
+        num_experts,
+        tile,
+        block_size,
+        num_warps=8 if tiles >= 16 else 4,
+    )
+    return sorted_ids, expert_ids, total
+
+
+def moe_align_block_size_sm89(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None = None,
+    pad_sorted_ids: bool = False,
+    ignore_invalid_experts: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Preserve flattened token order within each expert on SM89.
+
+    Small shapes use one CTA; larger shapes use tiled counting and a fused
+    prefix/scatter pass. Unmeasured shapes retain the general fallback.
+    Out-of-range IDs are ignored by the fast paths.
+    """
+    pairs = topk_ids.numel()
+    if not (
+        num_experts == 256
+        and expert_map is None
+        and 0 < pairs <= 16384
+        and (
+            (pairs <= 512 and block_size in (8, 16))
+            or (pairs > 512 and block_size in (8, 16, 32, 48, 64))
+        )
+        and topk_ids.is_cuda
+        and topk_ids.is_contiguous()
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and current_platform.is_device_capability(89)
+    ):
+        return moe_align_block_size(
+            topk_ids,
+            block_size,
+            num_experts,
+            expert_map,
+            pad_sorted_ids,
+            ignore_invalid_experts,
+        )
+    if pairs > 512:
+        return _large_stable_align(topk_ids, block_size, num_experts, pad_sorted_ids)
+    capacity = pairs + num_experts * (block_size - 1)
+    if pad_sorted_ids:
+        capacity = round_up(capacity, block_size)
+    if pairs < num_experts:
+        capacity = min(pairs * block_size, capacity)
+    max_blocks = triton.cdiv(capacity, block_size)
+    sorted_ids = torch.empty((capacity,), dtype=torch.int32, device=topk_ids.device)
+    expert_ids = torch.empty((max_blocks,), dtype=torch.int32, device=topk_ids.device)
+    total = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
+    _small_stable_align_kernel[(1,)](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        total,
+        pairs,
+        num_experts,
+        block_size,
+        capacity,
+        max_blocks,
+        triton.next_power_of_2(pairs),
+        triton.next_power_of_2(capacity),
+        triton.next_power_of_2(max_blocks),
+        num_warps=4,
+    )
+    return sorted_ids, expert_ids, total
 
 
 def batched_moe_align_block_size(

@@ -10,6 +10,7 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .op import exp, log
@@ -439,6 +440,19 @@ def fused_recurrent_gated_delta_rule_packed_decode(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
     BV = min(triton.next_power_of_2(V), 32)
+    if (
+        0 < B <= 8
+        and H == 8
+        and HV == 16
+        and K == V == 128
+        and mixed_qkv.dtype == torch.bfloat16
+        and initial_state.dtype in (torch.bfloat16, torch.float32)
+        and use_qk_l2norm_in_kernel
+        and current_platform.is_device_capability(89)
+    ):
+        # More CTAs and fewer registers improve tiny batches on SM89 while
+        # keeping the single-warp reduction order unchanged.
+        BV = 8
     num_stages = 3
     num_warps = 1
 

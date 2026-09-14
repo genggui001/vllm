@@ -351,6 +351,19 @@ __global__ void Marlin(
     static_assert(s_type == vllm::kFloat16);
   }
 
+  constexpr bool sm89_m1 = a_type == vllm::kFE4M3fn && m_block_size_8;
+  constexpr bool local_k128_reduce = sm89_m1 && thread_k_blocks == 4;
+  if constexpr (sm89_m1) {
+    static_assert(m_block_size_8 && threads == 128 && thread_m_blocks == 1);
+    static_assert(a_type == vllm::kFE4M3fn && b_type == vllm::kU4B8);
+    static_assert(c_type == vllm::kBFloat16 && s_type == vllm::kBFloat16);
+    static_assert(group_blocks == 8 && stages == 4 && !is_zp_float);
+    static_assert((thread_n_blocks == 4 && thread_k_blocks == 8) ||
+                  (thread_n_blocks == 8 && thread_k_blocks == 4));
+    use_fp32_reduce = true;
+    use_atomic_add = false;
+    has_bias = false;
+  }
   constexpr bool is_a_8bit = a_type.size_bits() == 8;
   if constexpr (!is_a_8bit) {
     static_assert(std::is_same<scalar_t, c_scalar_t>::value);
@@ -446,6 +459,14 @@ __global__ void Marlin(
       reinterpret_cast<int*>(sh_rd_block_sorted_ids_int4);
   c_scalar_t2* sh_block_topk_weights =
       reinterpret_cast<c_scalar_t2*>(sh_block_topk_weights_int4);
+
+  // Inactive FP8 rows still participate in fragment loads and scaling.
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+  if constexpr (a_type == vllm::kFE4M3fn) {
+    if (threadIdx.x < 16 * thread_m_blocks) sh_a_s[threadIdx.x] = 0.0f;
+    __syncthreads();
+  }
+  #endif
 
   int32_t block_num_valid_tokens = 0;
   int32_t locks_off = 0;
@@ -621,9 +642,10 @@ __global__ void Marlin(
     }
     if (is_a_8bit && (first_init || slice_col == 0)) {
       __syncthreads();
-      cp_async1_ca_pred(&sh_a_s[threadIdx.x],
-                        &a_scales_ptr[sh_rd_block_sorted_ids[threadIdx.x]],
-                        threadIdx.x < block_num_valid_tokens);
+      if (threadIdx.x < block_num_valid_tokens) {
+        cp_async1_ca_pred(&sh_a_s[threadIdx.x],
+                          &a_scales_ptr[sh_rd_block_sorted_ids[threadIdx.x]]);
+      }
     }
   };
 
@@ -636,9 +658,10 @@ __global__ void Marlin(
       update_next_moe_block_data();
       if (is_a_8bit) {
         __syncthreads();
-        cp_async1_ca_pred(&sh_a_s[threadIdx.x],
-                          &a_scales_ptr[sh_rd_block_sorted_ids[threadIdx.x]],
-                          threadIdx.x < block_num_valid_tokens);
+        if (threadIdx.x < block_num_valid_tokens) {
+          cp_async1_ca_pred(&sh_a_s[threadIdx.x],
+                            &a_scales_ptr[sh_rd_block_sorted_ids[threadIdx.x]]);
+        }
       }
     }
   };
@@ -892,11 +915,26 @@ __global__ void Marlin(
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
   int4* sh_a = sh_s + sh_s_size;
 
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+  if constexpr (a_type == vllm::kFE4M3fn) {
+    // Masked rows and pipeline read-ahead can touch lanes that were never
+    // fetched. Initialize the actual shared layout once, without changing
+    // valid input loads or the accumulation order.
+    constexpr int sh_pipeline_size =
+        sh_b_red_bias_size + stages * (g_idx_stage + zp_sh_stage) + sh_s_size +
+        stages * moe_block_size * a_sh_stride;
+    for (int i = threadIdx.x; i < sh_pipeline_size; i += threads)
+      sh_new[i] = {0, 0, 0, 0};
+    __syncthreads();
+  }
+  #endif
+
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
   I4 frag_b_quant[2][b_thread_vecs];
   FragC frag_c[thread_m_blocks][is_a_8bit ? 2 : 4][2];
   FragC frag_c_tmp[thread_m_blocks][is_a_8bit ? 2 : 4][2];
+  float first_k128[2][4] = {};
   FragS frag_s[2][4];  // No act-order
   FragS frag_bias[2][4];
   FragS act_frag_s[2][4][4];             // For act-order
@@ -925,7 +963,7 @@ __global__ void Marlin(
   // Zero accumulators.
   auto zero_accums = [&]() {
   #pragma unroll
-    for (int i = 0; i < thread_m_blocks * 4 * 2 * 4; i++)
+    for (int i = 0; i < sizeof(frag_c) / sizeof(float); i++)
       reinterpret_cast<float*>(frag_c)[i] = 0;
   };
 
@@ -974,7 +1012,7 @@ __global__ void Marlin(
       for (int i = 0; i < a_sh_wr_iters; i++) {
         int row = a_gl_rd_delta_i / a_gl_stride * i + a_gl_rd_row;
         int64_t sorted_row = 0;
-        if (!m_block_size_8 || row < 8)
+        if (row < block_num_valid_tokens)
           sorted_row = sh_rd_block_sorted_ids[row];
         int64_t true_idx =
             sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
@@ -1426,104 +1464,137 @@ __global__ void Marlin(
   };
 
   auto matmul_a8 = [&](int k) {
-    int k2 = k % 2;
+    if constexpr (sm89_m1) {
+      const int lane = threadIdx.x % 32;
+      const int k2 = k % 2;
   #pragma unroll
-    for (int j = 0; j < 2; j++) {
-      FragB frag_b[2];
-
-      if (is_a_8bit && b_type.size_bits() == 4 && !has_zp) {
+      for (int j = 0; j < 2; j++) {
+        FragB frag_b[2];
         dequant_data(frag_b_quant[k2][0][j * 2],
                      reinterpret_cast<scalar_32bit_t*>(&frag_b));
         dequant_data(frag_b_quant[k2][0][j * 2 + 1],
                      reinterpret_cast<scalar_32bit_t*>(&frag_b) + 2);
-      } else if (is_a_8bit && b_type.size_bits() == 4 && has_zp) {
-        int off = (threadIdx.x / 32) % 2 * 2 + j;
-        int zp = (frag_qzp[k2][0] >> (off * 8)) & 0xF;
-        dequant_data(frag_b_quant[k2][0][j * 2],
-                     reinterpret_cast<scalar_32bit_t*>(&frag_b), zp);
-        zp = (frag_qzp[k2][0] >> (off * 8 + 4)) & 0xF;
-        dequant_data(frag_b_quant[k2][0][j * 2 + 1],
-                     reinterpret_cast<scalar_32bit_t*>(&frag_b) + 2, zp);
-      } else {
-        reinterpret_cast<int2*>(&frag_b)[0] =
-            reinterpret_cast<int2*>(&frag_b_quant[k2][j])[0];
-        reinterpret_cast<int2*>(&frag_b)[1] =
-            reinterpret_cast<int2*>(&frag_b_quant[k2][j])[1];
+        mma_trans<a_type_id, false, 32>(frag_a[k2][0], frag_b[0], frag_b[1],
+                                        frag_c_tmp[0][j][0]);
+        if (k == 1) {
+          float2 s0 = Cdtype::num22float2(frag_s[k2][j * 2][0]);
+          float2 s1 = Cdtype::num22float2(frag_s[k2][j * 2 + 1][0]);
+          const int source_lane = lane / 8;
+          const float s00 = __shfl_sync(0xffffffff, s0.x, source_lane);
+          const float s01 = __shfl_sync(0xffffffff, s0.y, source_lane);
+          const float s10 = __shfl_sync(0xffffffff, s1.x, source_lane);
+          const float s11 = __shfl_sync(0xffffffff, s1.y, source_lane);
+          const float low = (lane / 4) % 2 ? s01 : s00;
+          const float high = (lane / 4) % 2 ? s11 : s10;
+  #pragma unroll
+          for (int g = 0; g < 4; g++) {
+            const float scale = g < 2 ? low : high;
+            frag_c[0][j][0][g] += frag_c_tmp[0][j][0][g] * scale;
+            frag_c_tmp[0][j][0][g] = 0.0f;
+          }
+        }
       }
+    } else {
+      int k2 = k % 2;
+  #pragma unroll
+      for (int j = 0; j < 2; j++) {
+        FragB frag_b[2];
+
+        if (is_a_8bit && b_type.size_bits() == 4 && !has_zp) {
+          dequant_data(frag_b_quant[k2][0][j * 2],
+                       reinterpret_cast<scalar_32bit_t*>(&frag_b));
+          dequant_data(frag_b_quant[k2][0][j * 2 + 1],
+                       reinterpret_cast<scalar_32bit_t*>(&frag_b) + 2);
+        } else if (is_a_8bit && b_type.size_bits() == 4 && has_zp) {
+          int off = (threadIdx.x / 32) % 2 * 2 + j;
+          int zp = (frag_qzp[k2][0] >> (off * 8)) & 0xF;
+          dequant_data(frag_b_quant[k2][0][j * 2],
+                       reinterpret_cast<scalar_32bit_t*>(&frag_b), zp);
+          zp = (frag_qzp[k2][0] >> (off * 8 + 4)) & 0xF;
+          dequant_data(frag_b_quant[k2][0][j * 2 + 1],
+                       reinterpret_cast<scalar_32bit_t*>(&frag_b) + 2, zp);
+        } else {
+          reinterpret_cast<int2*>(&frag_b)[0] =
+              reinterpret_cast<int2*>(&frag_b_quant[k2][j])[0];
+          reinterpret_cast<int2*>(&frag_b)[1] =
+              reinterpret_cast<int2*>(&frag_b_quant[k2][j])[1];
+        }
 
   #pragma unroll
-      for (int i = 0; i < thread_m_blocks; i++) {
-        mma<a_type_id, false, 32>(
-            frag_a[k2][i], frag_b[0],
-            (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
-        mma<a_type_id, false, 32>(
-            frag_a[k2][i], frag_b[1],
-            (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
-      }
+        for (int i = 0; i < thread_m_blocks; i++) {
+          mma<a_type_id, false, 32>(
+              frag_a[k2][i], frag_b[0],
+              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
+          mma<a_type_id, false, 32>(
+              frag_a[k2][i], frag_b[1],
+              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
+        }
 
-      if constexpr (group_blocks != -1) {
-        if (group_blocks == 2 || k == 1) {
-          if constexpr (a_type == vllm::kS8) {
-            int2 s_vals[2];
-            s_vals[0] = {
-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[1]};
-            s_vals[1] = {
-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
-                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
+        if constexpr (group_blocks != -1) {
+          if (group_blocks == 2 || k == 1) {
+            if constexpr (a_type == vllm::kS8) {
+              int2 s_vals[2];
+              s_vals[0] = {
+                  (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
+                  (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[1]};
+              s_vals[1] = {(int)reinterpret_cast<uint16_t*>(
+                               &frag_s[k2][j * 2 + 1][0])[0],
+                           (int)reinterpret_cast<uint16_t*>(
+                               &frag_s[k2][j * 2 + 1][0])[1]};
 
   #pragma unroll
-            for (int i = 0; i < thread_m_blocks; i++) {
+              for (int i = 0; i < thread_m_blocks; i++) {
   #pragma unroll
-              for (int g = 0; g < 4; g++) {
-                int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
-                *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
-                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
-                    scale;
-                frag_c_tmp[i][j][0][g] = 0.0f;
+                for (int g = 0; g < 4; g++) {
+                  int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
+                  *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
+                      *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
+                      scale;
+                  frag_c_tmp[i][j][0][g] = 0.0f;
+                }
+
+  #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                  int scale = reinterpret_cast<int*>(&s_vals[1])[g % 2];
+                  *reinterpret_cast<int32_t*>(&frag_c[i][j][1][g]) +=
+                      *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) *
+                      scale;
+                  frag_c_tmp[i][j][1][g] = 0.0f;
+                }
               }
-
-  #pragma unroll
-              for (int g = 0; g < 4; g++) {
-                int scale = reinterpret_cast<int*>(&s_vals[1])[g % 2];
-                *reinterpret_cast<int32_t*>(&frag_c[i][j][1][g]) +=
-                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) *
-                    scale;
-                frag_c_tmp[i][j][1][g] = 0.0f;
-              }
-            }
-          } else {
-            float2 s_vals[2];
-            if constexpr (s_type_id != vllm::kFE8M0fnu.id()) {
-              static_assert(a_type.size_bits() == 16 ||
-                            s_type.size_bits() == 16);
-              s_vals[0] = Cdtype::num22float2(frag_s[k2][j * 2][0]);
-              s_vals[1] = Cdtype::num22float2(frag_s[k2][j * 2 + 1][0]);
             } else {
-              int32_t* s_vals_int = reinterpret_cast<int32_t*>(&s_vals[0]);
-              int32_t s_vals_e8m0 =
-                  *reinterpret_cast<int32_t*>(&frag_s[k2][j][0]);
+              float2 s_vals[2];
+              if constexpr (s_type_id != vllm::kFE8M0fnu.id()) {
+                static_assert(a_type.size_bits() == 16 ||
+                              s_type.size_bits() == 16);
+                s_vals[0] = Cdtype::num22float2(frag_s[k2][j * 2][0]);
+                s_vals[1] = Cdtype::num22float2(frag_s[k2][j * 2 + 1][0]);
+              } else {
+                int32_t* s_vals_int = reinterpret_cast<int32_t*>(&s_vals[0]);
+                int32_t s_vals_e8m0 =
+                    *reinterpret_cast<int32_t*>(&frag_s[k2][j][0]);
 
-              s_vals_int[0] = (s_vals_e8m0 & 0xFF) << 23;
-              s_vals_int[1] = (s_vals_e8m0 & 0xFF00) << 15;
-              s_vals_int[2] = (s_vals_e8m0 & 0xFF0000) << 7;
-              s_vals_int[3] = (s_vals_e8m0 & 0xFF000000) >> 1;
-            }
-
-  #pragma unroll
-            for (int i = 0; i < thread_m_blocks; i++) {
-  #pragma unroll
-              for (int g = 0; g < 4; g++) {
-                float scale = reinterpret_cast<float*>(&s_vals[0])[g % 2];
-                frag_c[i][j][0][g] += frag_c_tmp[i][j][0][g] * scale;
-                frag_c_tmp[i][j][0][g] = 0.0f;
+                s_vals_int[0] = (s_vals_e8m0 & 0xFF) << 23;
+                s_vals_int[1] = (s_vals_e8m0 & 0xFF00) << 15;
+                s_vals_int[2] = (s_vals_e8m0 & 0xFF0000) << 7;
+                s_vals_int[3] = (s_vals_e8m0 & 0xFF000000) >> 1;
               }
 
   #pragma unroll
-              for (int g = 0; g < 4; g++) {
-                float scale = reinterpret_cast<float*>(&s_vals[1])[g % 2];
-                frag_c[i][j][1][g] += frag_c_tmp[i][j][1][g] * scale;
-                frag_c_tmp[i][j][1][g] = 0.0f;
+              for (int i = 0; i < thread_m_blocks; i++) {
+  #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                  float scale = reinterpret_cast<float*>(&s_vals[0])[g % 2];
+                  frag_c[i][j][0][g] += frag_c_tmp[i][j][0][g] * scale;
+                  frag_c_tmp[i][j][0][g] = 0.0f;
+                }
+
+  #pragma unroll
+                for (int g = 0; g < 4; g++) {
+                  float scale = reinterpret_cast<float*>(&s_vals[1])[g % 2];
+                  frag_c[i][j][1][g] += frag_c_tmp[i][j][1][g] * scale;
+                  frag_c_tmp[i][j][1][g] = 0.0f;
+                }
               }
             }
           }
@@ -1780,7 +1851,7 @@ __global__ void Marlin(
     if constexpr (m_block_size_8) {
       c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) +
                 (threadIdx.x % 32) / 4;
-      c_sh_wr += 64 * (threadIdx.x / 32);
+      c_sh_wr += (sm89_m1 ? 32 : 64) * (threadIdx.x / 32);
     } else {
       c_sh_wr =
           (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
@@ -1820,7 +1891,7 @@ __global__ void Marlin(
         c_scalar_t2 tmp_bias = b_bias[0];
         if constexpr (m_block_size_8) {
           tmp_bias = Cdtype::num2num2(
-              reinterpret_cast<scalar_t*>(&b_bias[0])[(threadIdx.x % 8) / 4]);
+              reinterpret_cast<c_scalar_t*>(&b_bias[0])[(threadIdx.x % 8) / 4]);
         }
         res = __hadd2(res, tmp_bias);
       }
@@ -1976,6 +2047,18 @@ __global__ void Marlin(
         }
       }
       slice_iters--;
+      if constexpr (local_k128_reduce) {
+        if (slice_iters == 2) {
+  #pragma unroll
+          for (int j = 0; j < 2; ++j) {
+  #pragma unroll
+            for (int g = 0; g < 4; ++g) {
+              first_k128[j][g] = frag_c[0][j][0][g];
+              frag_c[0][j][0][g] = 0.0f;
+            }
+          }
+        }
+      }
       if (slice_iters == 0) {
         break;
       }
@@ -2025,7 +2108,8 @@ __global__ void Marlin(
         float frag_a_s[2 * thread_m_blocks];
 
         for (int i = 0; i < 2 * thread_m_blocks; i++)
-          frag_a_s[i] = sh_a_s[i * 8 + (threadIdx.x % 32) / 4];
+          frag_a_s[i] = sh_a_s[sm89_m1 ? 2 * (threadIdx.x % 4) + i
+                                       : i * 8 + (threadIdx.x % 32) / 4];
 
   #pragma unroll
         for (int j = 0; j < 2; j++) {
@@ -2038,18 +2122,27 @@ __global__ void Marlin(
               if constexpr (a_type == vllm::kS8) {
                 c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
               }
-              float s_val = frag_a_s[i * 2 + g / 2];
-              frag_c[i][j][0][g] = c_val * s_val;
-            }
-  #pragma unroll
-            for (int g = 0; g < 4; g++) {
-              float c_val = frag_c[i][j][1][g];
-
-              if constexpr (a_type == vllm::kS8) {
-                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
+              float s_val = frag_a_s[i * 2 + (sm89_m1 ? g % 2 : g / 2)];
+              if constexpr (local_k128_reduce) {
+                // Match the native two-CTA FP32 rounding order.
+                float first_scaled = __fmul_rn(first_k128[j][g], s_val);
+                float second_scaled = __fmul_rn(c_val, s_val);
+                frag_c[i][j][0][g] = __fadd_rn(first_scaled, second_scaled);
+              } else {
+                frag_c[i][j][0][g] = c_val * s_val;
               }
-              float s_val = frag_a_s[i * 2 + g / 2];
-              frag_c[i][j][1][g] = c_val * s_val;
+            }
+            if constexpr (!sm89_m1) {
+  #pragma unroll
+              for (int g = 0; g < 4; g++) {
+                float c_val = frag_c[i][j][1][g];
+
+                if constexpr (a_type == vllm::kS8) {
+                  c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
+                }
+                float s_val = frag_a_s[i * 2 + (sm89_m1 ? g % 2 : g / 2)];
+                frag_c[i][j][1][g] = c_val * s_val;
+              }
             }
           }
         }

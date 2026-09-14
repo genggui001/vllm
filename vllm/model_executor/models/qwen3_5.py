@@ -49,6 +49,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -446,6 +447,43 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
         # set MoE hyperparameters
         self.set_moe_parameters()
 
+    @property
+    def supports_vocab_parallel_greedy(self) -> bool:
+        """Whether the head supports exact, contiguous-shard argmax."""
+        head, processor = self.lm_head, self.logits_processor
+        if (
+            not isinstance(head, ParallelLMHead)
+            or type(processor) is not LogitsProcessor
+        ):
+            return False
+        shard = head.shard_indices
+        return (
+            head.tp_size == 2
+            and type(head.quant_method) is UnquantizedEmbeddingMethod
+            and head.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and processor.head_dtype
+            in (None, torch.float16, torch.bfloat16, torch.float32)
+            and not processor.logits_as_input
+            and processor.scale == 1.0
+            and processor.soft_cap is None
+            and 0 < processor.org_vocab_size <= 2**24
+            and head.org_vocab_size == processor.org_vocab_size
+            # This global check makes the decision identical on both ranks.
+            and head.org_vocab_size_padded == head.org_vocab_size
+            and shard.num_added_elements_padded == 0
+            and shard.num_org_vocab_padding == 0
+            and shard.num_org_elements > 0
+            and shard.padded_org_vocab_start_index == shard.org_vocab_start_index
+        )
+
+    def compute_greedy_token_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return int32 [N, 1] IDs without gathering the full vocabulary."""
+        return (
+            self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+            .to(torch.int32)
+            .unsqueeze(-1)
+        )
+
 
 ########################################################
 # Qwen3_5-Dense
@@ -683,6 +721,13 @@ class Qwen3_5MoeForConditionalGeneration(
 ):
     # For MoE LoRA weights loading
     is_3d_moe_weight: bool = True
+
+    @property
+    def supports_vocab_parallel_greedy(self) -> bool:
+        return self.language_model.supports_vocab_parallel_greedy
+
+    def compute_greedy_token_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.language_model.compute_greedy_token_ids(hidden_states)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__

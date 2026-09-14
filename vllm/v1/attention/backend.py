@@ -904,6 +904,9 @@ class AttentionImplBase(ABC, Generic[T]):
     # TODO add support to more backends:
     # https://github.com/vllm-project/vllm/issues/25584
     supports_quant_query_input: bool = False
+    # Backends that require CUDA's direct FP32-to-FP8 rounding can opt out of
+    # compiler-generated query casts (which may round through FP16 on SM89).
+    enforce_cuda_query_quant: bool = False
 
     dcp_world_size: int
     dcp_rank: int

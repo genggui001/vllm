@@ -555,3 +555,66 @@ def test_flash_attn_accepts_handled_fp8_variants(
     # import order across earlier tests that patch vllm.platforms.current_platform.
     monkeypatch.setattr(fa_utils_mod.current_platform, "is_xpu", lambda: True)
     assert FlashAttentionBackend.supports_kv_cache_dtype(kv_cache_dtype)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="Native FP8 auto selection requires SM89",
+)
+@pytest.mark.parametrize(
+    "changed_field, changed_value",
+    [
+        (None, None),
+        ("num_bits", 4),
+        ("type", "int"),
+        ("strategy", "attn_head"),
+        ("symmetric", False),
+        ("dynamic", True),
+    ],
+)
+def test_sm89_attention_auto_selection_honors_checkpoint(
+    default_vllm_config, changed_field, changed_value
+):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsConfig,
+    )
+    from vllm.v1.attention.selector import (
+        AttentionSelectorConfig,
+        _get_sm89_fp8_backend,
+    )
+
+    scheme = dict(
+        num_bits=8, type="float", strategy="tensor", symmetric=True, dynamic=False
+    )
+    if changed_field is not None:
+        scheme[changed_field] = changed_value
+    config = default_vllm_config
+    config.quant_config = CompressedTensorsConfig(
+        target_scheme_map={},
+        ignore=[],
+        quant_format="pack-quantized",
+        kv_cache_scheme=scheme,
+    )
+    selector = AttentionSelectorConfig(256, torch.bfloat16, "fp8_e4m3", 16)
+    actual = _get_sm89_fp8_backend(config, selector)
+    expected = AttentionBackendEnum.FLASH_ATTN_FP8_SM89
+    assert actual == (expected if changed_field is None else None)
+    if changed_field is not None:
+        return
+    assert get_attn_backend(256, torch.bfloat16, "fp8_e4m3").get_name() == expected.name
+    # Cache dtype and unsupported features must remain part of selection.
+    for overrides in (
+        dict(kv_cache_dtype="auto"),
+        dict(kv_cache_dtype="fp8_e5m2"),
+        dict(head_size=192),
+        dict(has_sliding_window=True),
+        dict(use_non_causal=True),
+        dict(use_batch_invariant=True),
+    ):
+        assert _get_sm89_fp8_backend(config, selector._replace(**overrides)) is None
+    # Explicit backend selection always takes precedence over auto selection.
+    config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+    assert get_attn_backend(256, torch.bfloat16, "fp8_e4m3").get_name() == "TRITON_ATTN"
+    config.attention_config.backend = None
+    config.quant_config.kv_cache_scheme = None
+    assert _get_sm89_fp8_backend(config, selector) is None

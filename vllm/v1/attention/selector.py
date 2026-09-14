@@ -12,10 +12,12 @@ from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.registry import (
+    AttentionBackendEnum,
     MambaAttentionBackendEnum,
 )
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheSpecKind
 
 logger = init_logger(__name__)
@@ -182,11 +184,53 @@ def get_attn_backend(
         )
         backend = attention_config.backend_per_kind.get(kind.value, backend)
 
+    if backend is None:
+        backend = _get_sm89_fp8_backend(vllm_config, attn_selector_config)
+
     return _cached_get_attn_backend(
         backend=backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
     )
+
+
+def _get_sm89_fp8_backend(
+    vllm_config: "VllmConfig", attn_selector_config: AttentionSelectorConfig
+) -> AttentionBackendEnum | None:
+    """Honor a checkpoint's static tensor FP8 QKV recipe on Ada."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda() or not current_platform.is_device_capability(89):
+        return None
+    quant_config = vllm_config.quant_config
+    if quant_config is None or quant_config.get_name() != "compressed-tensors":
+        return None
+    scheme = getattr(quant_config, "kv_cache_scheme", None)
+    if not (
+        scheme
+        and scheme.get("num_bits") == 8
+        and scheme.get("type") == "float"
+        and scheme.get("strategy") == "tensor"
+        and scheme.get("symmetric") is True
+        and scheme.get("dynamic", False) is False
+        and attn_selector_config.kv_cache_dtype in ("fp8", "fp8_e4m3")
+    ):
+        return None
+    parallel_config = vllm_config.parallel_config
+    if (
+        parallel_config.decode_context_parallel_size != 1
+        or parallel_config.prefill_context_parallel_size != 1
+    ):
+        return None
+    capability = current_platform.get_device_capability()
+    if capability is None:
+        return None
+    candidate = AttentionBackendEnum.FLASH_ATTN_FP8_SM89
+    invalid_reasons = candidate.get_class().validate_configuration(
+        device_capability=capability,
+        **attn_selector_config._asdict(),
+    )
+    return None if invalid_reasons else candidate
 
 
 @cache

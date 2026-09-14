@@ -188,6 +188,10 @@ from vllm.v1.outputs import (
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm.v1.sample.logits_processor.builtin import (
+    LogitBiasLogitsProcessor,
+    MinTokensLogitsProcessor,
+)
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
@@ -486,7 +490,7 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -495,6 +499,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    greedy_token_ids: torch.Tensor | None = None
 
 
 class GPUModelRunner(
@@ -523,6 +528,11 @@ class GPUModelRunner(
         parallel_config = self.parallel_config
         self.device = device
         self.dtype = self.model_config.dtype
+        self._vocab_parallel_greedy_supported = (
+            device.type == "cuda"
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(89)
+        )
 
         self.check_ep_fault = False
         if parallel_config.data_parallel_size > 1 and self.model_config.is_moe:
@@ -3757,6 +3767,52 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    def _can_use_vocab_parallel_greedy(
+        self, scheduler_output: "SchedulerOutput", num_rows: int
+    ) -> bool:
+        # Small batches do not amortize the pair collective on SM89 TP2.
+        if (
+            num_rows < 64
+            or not self._vocab_parallel_greedy_supported
+            or self.parallel_config.tensor_parallel_size != 2
+            or self.parallel_config.pipeline_parallel_size != 1
+            or self.broadcast_pp_output
+            or self.speculative_config is not None
+            or self.lora_config is not None
+            or scheduler_output.has_structured_output_requests
+            or envs.VLLM_COMPUTE_NANS_IN_LOGITS
+            or not getattr(self.model, "supports_vocab_parallel_greedy", False)
+        ):
+            return False
+        batch = self.input_batch
+        metadata = batch.sampling_metadata
+        if (
+            not metadata.all_greedy
+            or metadata.max_num_logprobs is not None
+            or metadata.logprob_token_ids
+            or not metadata.no_penalties
+            or metadata.allowed_token_ids_mask is not None
+            or metadata.bad_words_token_ids
+        ):
+            return False
+        holder = metadata.thinking_budget_state_holder
+        if holder is not None and holder.has_tracked_requests():
+            return False
+        for processor in metadata.logitsprocs.non_argmax_invariant:
+            if type(processor) is LogitBiasLogitsProcessor:
+                if processor.biases:
+                    return False
+            elif type(processor) is MinTokensLogitsProcessor:
+                if processor.min_toks:
+                    return False
+            else:
+                return False
+        for req_id in batch.req_ids:
+            params = self.requests[req_id].sampling_params
+            if params is None or params.prompt_logprobs is not None:
+                return False
+        return True
+
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -4570,6 +4626,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        greedy_token_ids = None
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4597,7 +4654,15 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if self._can_use_vocab_parallel_greedy(
+                    scheduler_output, sample_hidden_states.shape[0]
+                ):
+                    greedy_token_ids = self.model.compute_greedy_token_ids(
+                        sample_hidden_states
+                    )
+                    logits = None
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4639,6 +4704,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            greedy_token_ids,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4690,18 +4756,28 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            greedy_token_ids,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
+            if greedy_token_ids is not None:
+                logits = self.model.compute_logits(sample_hidden_states)
+                greedy_token_ids = None
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            if greedy_token_ids is None:
+                sampler_output = self._sample(logits, spec_decode_metadata)
+            else:
+                self.input_batch.update_async_output_token_ids()
+                sampler_output = SamplerOutput(
+                    sampled_token_ids=greedy_token_ids, logprobs_tensors=None
+                )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

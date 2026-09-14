@@ -11,7 +11,9 @@ import torch
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
+    moe_align_block_size_sm89,
 )
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import set_random_seed
 
@@ -179,6 +181,71 @@ def torch_moe_align_block_size(
     )
 
     return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(89), reason="SM89 fast path"
+)
+@pytest.mark.parametrize(
+    "pairs,block_size,pad",
+    [
+        (1, 8, False),
+        (8, 16, True),
+        (127, 16, False),
+        (255, 8, True),
+        (256, 16, False),
+        (512, 16, True),
+        (513, 16, False),
+        (1023, 32, True),
+        (1024, 32, False),
+        (1025, 48, True),
+        (16383, 64, False),
+        (16384, 64, True),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_sm89_alignment_preserves_stable_order_on_graph_replay(
+    pairs: int, dtype: torch.dtype, block_size: int, pad: bool
+):
+    """Routing, sentinel padding, and stable ordering survive changing IDs."""
+    ids = torch.randint(0, 256, (pairs, 1), dtype=dtype, device="cuda")
+    moe_align_block_size_sm89(ids, block_size, 256, pad_sorted_ids=pad)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = moe_align_block_size_sm89(ids, block_size, 256, pad_sorted_ids=pad)
+    for pattern in ("random", "same_expert", "invalid"):
+        if pattern == "same_expert":
+            ids.fill_(255)
+        elif pattern == "invalid":
+            ids.fill_(-1)
+            ids[::3] = 256 if dtype == torch.int32 else 2**40
+        original_ids = ids.cpu()
+        graph.replay()
+        assert torch.equal(ids.cpu(), original_ids)
+        expected = torch_moe_align_block_size(
+            original_ids, block_size, 256, pad_sorted_ids=pad
+        )
+        assert all(torch.equal(x.cpu(), y) for x, y in zip(actual, expected))
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA alignment fallback")
+@pytest.mark.parametrize(
+    "pairs,experts,block_size", [(16385, 256, 16), (8, 257, 16), (8, 256, 32)]
+)
+def test_sm89_alignment_fallback_preserves_routing(pairs, experts, block_size):
+    """Shapes outside the measured fast path retain every routed token."""
+    ids = torch.randint(0, experts, (pairs, 1), dtype=torch.int32, device="cuda")
+    actual = tuple(x.cpu() for x in moe_align_block_size_sm89(ids, block_size, experts))
+    expected = torch_moe_align_block_size(ids.cpu(), block_size, experts)
+    assert torch.equal(actual[2], expected[2])
+    length = actual[2].item()
+    assert torch.equal(
+        actual[1][: length // block_size], expected[1][: length // block_size]
+    )
+    _verify_expert_level_sorting(
+        actual[0], expected[0], actual[1], block_size, length, pairs
+    )
 
 
 @pytest.mark.parametrize("m", NUM_TOKENS)

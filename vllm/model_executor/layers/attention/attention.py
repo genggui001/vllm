@@ -473,6 +473,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 group_shape=GroupShape(-1, block_size)
                 if is_per_head
                 else GroupShape.PER_TENSOR,
+                enforce_enable=self.impl.enforce_cuda_query_quant,
             )
 
     def forward(

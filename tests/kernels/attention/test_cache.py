@@ -45,6 +45,49 @@ KV_CACHE_DTYPE = ["auto", "fp8"]
 RESHAPE_FLASH_IMPLEMENTATIONS = ["cuda", "triton"]
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="Native QKV-FP8 backend requires SM89",
+)
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sm89_fp8_cache_update_bytes(layout, dtype):
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.flash_attn_fp8_sm89 import (
+        FlashAttentionFP8SM89Impl,
+    )
+
+    set_random_seed(20260913)
+    device = "cuda:0"
+    qkv = torch.randn(17, 3, 4, 256, device=device, dtype=dtype)
+    _, key, value = qkv.unbind(1)
+    # Include saturation and midpoint neighborhoods along with ordinary values.
+    key[0, 0, :4] = torch.tensor([50.01864, 136.10587, 500, -500], device=device)
+    layer = SimpleNamespace(
+        _k_scale=torch.tensor(0.023171, device=device),
+        _v_scale=torch.tensor(0.0625, device=device),
+    )
+    shape = (3, 16, 4, 512) if layout == "NHD" else (3, 4, 16, 512)
+    storage = torch.full(shape, 0x55, dtype=torch.uint8, device=device)
+    cache = storage.transpose(1, 2) if layout == "NHD" else storage
+    expected = cache.clone()
+    slots = torch.randperm(48, device=device)[:17]
+    slots[-1] = -1
+    impl = FlashAttentionFP8SM89Impl(8, 256, 1 / 16, 4, None, None, "fp8_e4m3")
+    impl.do_kv_cache_update(layer, key, value, cache, slots)
+    for tensor, scale, offset in (
+        (key, layer._k_scale, 0),
+        (value, layer._v_scale, 256),
+    ):
+        quantized = (tensor.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        expected[slots[:-1] // 16, :, slots[:-1] % 16, offset : offset + 256] = (
+            quantized[:-1].view(torch.uint8)
+        )
+    # This also checks that padding and every untouched cache byte are preserved.
+    assert torch.equal(cache, expected)
+
+
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)

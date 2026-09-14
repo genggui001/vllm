@@ -461,6 +461,31 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         "Marlin W4A16 on other devices).");
   }
 
+  const bool sm89_m1 = is_a_8bit && m_block_size_8;
+  const bool m1_fc1 = prob_m == 1 && top_k == 8 && prob_n == 512 &&
+                      prob_k == 2048 && !mul_topk_weights;
+  const bool m1_fc2 = prob_m == 8 && top_k == 1 && prob_n == 2048 &&
+                      prob_k == 256 && mul_topk_weights;
+  if (sm89_m1) {
+    STD_TORCH_CHECK(
+        major_capability == 8 && minor_capability == 9 && sms == 114 &&
+            a_type == vllm::kFE4M3fn && b_type == vllm::kU4B8 &&
+            c_type == vllm::kBFloat16 && s_type == vllm::kBFloat16 &&
+            num_experts == 256 && group_size == 128 && is_k_full &&
+            !has_act_order && !has_zp && !has_bias && !is_zp_float &&
+            use_fp32_reduce && !use_atomic_add && (m1_fc1 || m1_fc2),
+        "Unsupported SM89 single-token FP8 Marlin configuration");
+    const int selected_k = m1_fc1 ? 128 : 64;
+    const int selected_n = m1_fc1 ? 64 : 128;
+    STD_TORCH_CHECK((thread_k == -1 || thread_k == selected_k) &&
+                        (thread_n == -1 || thread_n == selected_n) &&
+                        (blocks_per_sm == -1 || blocks_per_sm == 2),
+                    "Unsupported SM89 single-token launch override");
+    thread_k = selected_k;
+    thread_n = selected_n;
+    blocks_per_sm = 2;
+  }
+
   // Set thread config
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
@@ -485,7 +510,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
-  int blocks = sms * exec_cfg.blocks_per_sm;
+  int blocks = sm89_m1 && m1_fc2 ? 128 : sms * exec_cfg.blocks_per_sm;
   if (exec_cfg.blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 

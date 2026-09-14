@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -22,10 +23,110 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
 from vllm.model_executor.layers.quantization import moe_wna16
 from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
 from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsConfig,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe import (  # noqa: E501
+    CompressedTensorsMoEMethod,
+)
 from vllm.model_executor.layers.quantization.moe_wna16 import (
     MoeWNA16Config,
     MoeWNA16Method,
 )
+from vllm.platforms import current_platform
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="Native W4A8-FP8 config selection requires SM89",
+)
+@pytest.mark.parametrize("moe_backend", ["auto", "marlin", "triton"])
+@pytest.mark.parametrize("activation_type", ["float", "int", None])
+def test_sm89_compressed_tensors_moe_honors_activation_quantization(
+    default_vllm_config, monkeypatch, moe_backend, activation_type
+):
+    """Config-selected FP8 must survive backend selection and dtype overrides."""
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    # An unrelated legacy override must not change the checkpoint's FP8 recipe.
+    monkeypatch.setenv("VLLM_MARLIN_INPUT_DTYPE", "int8")
+    quant_config = CompressedTensorsConfig.from_config(
+        {
+            "format": "pack-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "int",
+                        "strategy": "group",
+                        "group_size": 128,
+                        "symmetric": True,
+                        "dynamic": False,
+                    },
+                    "input_activations": (
+                        {
+                            "num_bits": 8,
+                            "type": activation_type,
+                            "strategy": "token",
+                            "symmetric": True,
+                            "dynamic": True,
+                        }
+                        if activation_type is not None
+                        else None
+                    ),
+                }
+            },
+        }
+    )
+    layer = Mock(spec=RoutedExperts)
+    layer.moe_config = make_dummy_moe_config(
+        num_experts=8, experts_per_token=2, hidden_dim=2048, intermediate_size=256
+    )
+    layer.moe_config.moe_backend = moe_backend
+    if activation_type == "int":
+        scheme = quant_config.target_scheme_map["Linear"]
+        # The native FP8 path must not capture integer activation recipes.
+        assert not quant_config._is_fp8_w4a8_sm89(
+            scheme["weights"], scheme["input_activations"]
+        )
+        return
+    if activation_type == "float" and moe_backend == "triton":
+        with pytest.raises(ValueError, match="requires moe_backend='marlin'"):
+            CompressedTensorsMoEMethod.get_moe_method(quant_config, layer, "experts")
+        return
+    method = CompressedTensorsMoEMethod.get_moe_method(quant_config, layer, "experts")
+    if activation_type == "float":
+        assert method.wna16_backend == WNA16MoEBackend.MARLIN
+        assert method.input_dtype == torch.float8_e4m3fn
+    else:
+        # Integer activation quantization has its own method; W4A16 keeps its
+        # existing backend selection and optional Marlin environment override.
+        assert getattr(method, "input_dtype", None) != torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize("input_dtype", [None, torch.float8_e4m3fn])
+def test_batched_marlin_preserves_configured_activation_dtype(monkeypatch, input_dtype):
+    """Batched expert construction must retain the factory's activation recipe."""
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+        BatchedMarlinExperts,
+        MarlinExpertsBase,
+    )
+
+    def initialize_without_weights(self, **kwargs):
+        self.input_dtype = kwargs.get("input_dtype")
+
+    # Isolate argument forwarding from CUDA weight/workspace initialization.
+    monkeypatch.setattr(MarlinExpertsBase, "__init__", initialize_without_weights)
+    experts = BatchedMarlinExperts(
+        moe_config=None,
+        quant_config=None,
+        max_num_tokens=128,
+        num_dispatchers=2,
+        input_dtype=input_dtype,
+    )
+    assert experts.input_dtype == input_dtype
 
 
 def test_map_wna16_backend_supports_triton():

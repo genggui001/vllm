@@ -24,6 +24,163 @@ SCALE_UBS = [True, False]
 SEEDS = [0]
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="SM89 fused activation and token FP8 rounding",
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "m,n,strided", [(0, 256, False), (8, 256, False), (136, 256, True), (7, 17, True)]
+)
+def test_sm89_silu_token_fp8_preserves_cuda_bytes(dtype, m, n, strided):
+    """Preserve both activation roundings, negative zeros and token scales."""
+    from vllm.model_executor.layers.quantization.utils.fp8_sm89 import (
+        silu_and_mul_token_fp8,
+    )
+
+    set_random_seed(20260913)
+    x = torch.randn(m, 2 * n + (8 if strided else 0), device="cuda", dtype=dtype)
+    x = x[:, : 2 * n]
+    if m:
+        x[:, :4] = torch.tensor([-0.0, 0.0, -1.0, 2.0], device="cuda", dtype=dtype)
+        x[:, n : n + 4] = torch.tensor(
+            [-0.0, -0.0, -0.0, 0.0], device="cuda", dtype=dtype
+        )
+    actual, scale = silu_and_mul_token_fp8(x)
+    assert actual.shape == (m, n) and scale.shape == (m, 1)
+    if not m:
+        return
+    activation = torch.empty((m, n), device="cuda", dtype=dtype)
+    torch.ops._C.silu_and_mul(activation, x.contiguous())
+    expected, expected_scale = ops.scaled_fp8_quant(
+        activation, None, use_per_token_if_dynamic=True
+    )
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(scale, expected_scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual, scale = silu_and_mul_token_fp8(x)
+    graph.replay()
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(scale, expected_scale)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="SM89 native FP8 rounding regression",
+)
+def test_sm89_attention_fp8_conversion_rounds_once():
+    """FP16 intermediates must not change rounding near E4M3 midpoints."""
+    from vllm.triton_utils import tl, triton
+    from vllm.v1.attention.ops.flash_attn_fp8_sm89 import _fp32_to_e4m3_rn
+
+    @triton.jit
+    def convert(X, Y, N: tl.constexpr):
+        indices = tl.program_id(0) * 256 + tl.arange(0, 256)
+        values = tl.load(X + indices, indices < N, other=0.0)
+        tl.store(Y + indices, _fp32_to_e4m3_rn(values), indices < N)
+
+    values = (
+        torch.arange(127, dtype=torch.uint8, device="cuda")
+        .view(torch.float8_e4m3fn)
+        .float()
+    )
+    midpoints = (values[:-1] + values[1:]) * 0.5
+    positive = torch.cat(
+        (
+            midpoints,
+            torch.nextafter(midpoints, torch.full_like(midpoints, torch.inf)),
+            torch.nextafter(midpoints, torch.full_like(midpoints, -torch.inf)),
+            torch.tensor([0.0, 50.0186386, 136.1058655, 448.0, 512.0], device="cuda"),
+        )
+    )
+    inputs = torch.cat((positive, -positive))
+    expected = inputs.clamp(-448, 448).to(torch.float8_e4m3fn)
+    actual = torch.empty_like(expected)
+    convert[(triton.cdiv(inputs.numel(), 256),)](inputs, actual, inputs.numel())
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="SM89 native FP8 quantization dispatch regression",
+)
+@pytest.mark.parametrize("static", [False, True])
+def test_sm89_fp8_quant_preserves_cuda_bytes_with_compilation(
+    default_vllm_config, monkeypatch, static
+):
+    from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+    from vllm.model_executor.layers.quantization.utils import marlin_utils
+    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+    from vllm.v1.attention.backends.flash_attn_fp8_sm89 import FlashAttentionFP8SM89Impl
+
+    default_vllm_config.compilation_config.custom_ops = ["none"]
+    monkeypatch.setattr(marlin_utils, "_quant_fp8_method", None)
+    set_random_seed(20260913)
+    x = torch.randn(33, 2048, device="cuda", dtype=torch.bfloat16)
+    scale = torch.tensor(0.023171, device="cuda") if static else None
+    quant = (
+        QuantFP8(
+            True,
+            GroupShape.PER_TENSOR,
+            enforce_enable=FlashAttentionFP8SM89Impl.enforce_cuda_query_quant,
+        )
+        if static
+        else marlin_utils.get__quant_fp8_method()
+    )
+    expected, expected_scale = ops.scaled_fp8_quant(
+        x, scale, use_per_token_if_dynamic=not static
+    )
+    for call in (quant, torch.compile(quant, fullgraph=True)):
+        actual, actual_scale = call(x, scale)
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(actual_scale, expected_scale)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="SM89 config-selected FP8 Marlin initialization regression",
+)
+def test_sm89_marlin_quant_forward_without_config_context(monkeypatch):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.config import (
+        VllmConfig,
+        get_current_vllm_config_or_none,
+        set_current_vllm_config,
+    )
+    from vllm.model_executor.layers.fused_moe.config import int4_w4a16_moe_quant_config
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
+    from vllm.model_executor.layers.quantization.utils import marlin_utils
+
+    monkeypatch.delenv("VLLM_MARLIN_INPUT_DTYPE", raising=False)
+    monkeypatch.setattr(marlin_utils, "_quant_fp8_method", None)
+    assert get_current_vllm_config_or_none() is None
+    config = VllmConfig()
+    config.compilation_config.custom_ops = ["none"]
+    with set_current_vllm_config(config):
+        experts = MarlinExperts(
+            moe_config=make_dummy_moe_config(
+                num_experts=8,
+                experts_per_token=2,
+                hidden_dim=2048,
+                intermediate_size=256,
+            ),
+            quant_config=int4_w4a16_moe_quant_config(
+                w1_scale=torch.ones(8, 16, 512),
+                w2_scale=torch.ones(8, 2, 2048),
+                block_shape=[0, 128],
+            ),
+            input_dtype=torch.float8_e4m3fn,
+        )
+    assert get_current_vllm_config_or_none() is None
+    assert marlin_utils._quant_fp8_method is not None
+    x = torch.randn(17, 2048, device="cuda", dtype=torch.bfloat16)
+    actual, scale = marlin_utils.marlin_quant_input(x, experts.input_dtype)
+    expected, expected_scale = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(scale, expected_scale)
+
+
 def opcheck_fp8_quant(
     output,
     input,

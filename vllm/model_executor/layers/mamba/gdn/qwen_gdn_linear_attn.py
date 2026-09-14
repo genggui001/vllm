@@ -90,10 +90,49 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
+def _supports_sm89_short_prefill_graph(vllm_config: VllmConfig) -> bool:
+    config = vllm_config.model_config
+    text = config.hf_text_config
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability(89)
+        and config.dtype == torch.bfloat16
+        and getattr(text, "linear_key_head_dim", None) == 128
+        and getattr(text, "linear_value_head_dim", None) == 128
+        and getattr(text, "linear_num_key_heads", 0) == 8 * tp
+        and getattr(text, "linear_num_value_heads", 0) == 16 * tp
+        and not config.enforce_eager
+        and not config.enable_sleep_mode
+    )
+
+
+def _uses_sm89_fp8_recipe(vllm_config: VllmConfig) -> bool:
+    quant = vllm_config.quant_config
+    backend = vllm_config.attention_config.backend
+    if backend is not None and backend.name != "FLASH_ATTN_FP8_SM89":
+        return False
+    scheme = getattr(quant, "kv_cache_scheme", None)
+    return bool(
+        quant is not None
+        and quant.get_name() == "compressed-tensors"
+        and scheme
+        and scheme.get("num_bits") == 8
+        and scheme.get("type") == "float"
+        and scheme.get("strategy") == "tensor"
+        and scheme.get("symmetric") is True
+        and scheme.get("dynamic", False) is False
+        and vllm_config.cache_config.cache_dtype in ("fp8", "fp8_e4m3")
+    )
+
+
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "triton_graph", "flashinfer", "cutedsl"]]:
     """Resolve GDN prefill backend.
+
+    SM89 short-prefill graphs are prewarmed for the supported BF16 GDN shape.
+    They are automatic for the native FP8 recipe, or opt-in via triton_graph.
 
     FlashInfer's GDN prefill kernel is chosen when:
     * ``requested in ["flashinfer", "auto"]``;
@@ -116,6 +155,13 @@ def _resolve_gdn_prefill_backend(
 
     if not current_platform.is_cuda():
         return backend, "triton"
+
+    if _supports_sm89_short_prefill_graph(vllm_config) and (
+        backend == "triton_graph"
+        or backend == "auto"
+        and _uses_sm89_fp8_recipe(vllm_config)
+    ):
+        return backend, "triton_graph"
 
     head_k_dim = getattr(
         vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
@@ -154,6 +200,7 @@ def _log_gdn_backend_decision(
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
         "triton": "Triton/FLA",
+        "triton_graph": "Triton/FLA with prewarmed short-prefill CUDA Graphs",
     }[active_backend]
     logger.info_once(
         "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s).",
@@ -224,8 +271,18 @@ class ChunkGatedDeltaRule(CustomOp):
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
+        self._short_prefill_graph_cache = None
+        if active_backend == "triton_graph":
+            from vllm.model_executor.layers.mamba.ops.gdn_chunk_graph import (
+                get_short_prefill_graph_cache,
+            )
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+            self._short_prefill_graph_cache = get_short_prefill_graph_cache(vllm_config)
+
+        if (
+            backend in ("flashinfer", "cutedsl", "triton_graph")
+            and active_backend != backend
+        ):
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
                 "kernel on the current platform. Falling back to Triton/FLA.",
@@ -287,7 +344,8 @@ class ChunkGatedDeltaRule(CustomOp):
         use_qk_l2norm_in_kernel: bool = True,
         core_attn_out: torch.Tensor | None = None,
     ):
-        return fla_chunk_gated_delta_rule(
+        chunk = self._short_prefill_graph_cache or fla_chunk_gated_delta_rule
+        return chunk(
             q=q,
             k=k,
             v=v,
@@ -1083,6 +1141,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
+        graph_cache = self.chunk_gated_delta_rule._short_prefill_graph_cache
+        if graph_cache is not None:
+            graph_cache.warmup(device, state_dtype)
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Mirror the real

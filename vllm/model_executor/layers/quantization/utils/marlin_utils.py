@@ -659,7 +659,14 @@ _quant_fp8_method: QuantFP8 | None = None
 def get__quant_fp8_method() -> QuantFP8:
     global _quant_fp8_method
     if _quant_fp8_method is None:
-        _quant_fp8_method = QuantFP8(False, GroupShape.PER_TOKEN)
+        # SM89 compiler-generated FP8 casts can round through FP16, changing
+        # activation bytes near E4M3 midpoints. Keep CUDA's direct conversion.
+        _quant_fp8_method = QuantFP8(
+            False,
+            GroupShape.PER_TOKEN,
+            enforce_enable=current_platform.is_cuda()
+            and current_platform.is_device_capability(89),
+        )
     return _quant_fp8_method
 
 

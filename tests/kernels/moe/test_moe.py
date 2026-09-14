@@ -1059,6 +1059,43 @@ def test_fused_marlin_moe(
     torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="Native W4A8-FP8 requires SM89",
+)
+@pytest.mark.usefixtures("default_vllm_config")
+@pytest.mark.parametrize("m", [1, 17, 128])
+@pytest.mark.parametrize("fuse_activation", [False, True])
+def test_sm89_fused_marlin_moe_model_shape(m, fuse_activation, monkeypatch):
+    """Cover BF16 residuals and the TP2 expert dimensions of Qwen3.5 MoE."""
+    if fuse_activation:
+        from functools import partial
+
+        from vllm.model_executor.layers.quantization.utils.fp8_sm89 import (
+            silu_and_mul_token_fp8,
+        )
+
+        monkeypatch.setitem(
+            globals(),
+            "fused_marlin_moe",
+            partial(fused_marlin_moe, activation_quant_func=silu_and_mul_token_fp8),
+        )
+    test_fused_marlin_moe(
+        a_type=scalar_types.float8_e4m3fn,
+        b_type=scalar_types.uint4b8,
+        c_type=scalar_types.bfloat16,
+        group_blocks=8,
+        m=m,
+        n=256,
+        k=2048,
+        e=256,
+        topk=8,
+        ep_size=1,
+        act_order=False,
+        is_k_full=True,
+    )
+
+
 @pytest.mark.flaky(reruns=2)
 @pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
 @pytest.mark.usefixtures("default_vllm_config")
@@ -1556,6 +1593,30 @@ def test_moe_sum_pad_aware(topk: int, dtype: torch.dtype, topk_ids_dtype: torch.
     opcheck(torch.ops._moe_C.moe_sum, (input, actual, topk_ids, expert_map))
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="Native FP8 batched Marlin coverage requires SM89",
+)
+@pytest.mark.usefixtures("default_vllm_config")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("m", [1, 17])
+def test_sm89_batched_marlin_fp8_matches_flat_routing(m, dtype):
+    """Cover empty experts and padded odd batches with the group-128 FP8 recipe."""
+    test_batched_fused_marlin_moe(
+        m=m,
+        n=256,
+        k=2048,
+        e=8,
+        topk=2,
+        max_tokens_per_batch=64,
+        dtype=dtype,
+        quant_dtype=scalar_types.uint4b8,
+        input_type=scalar_types.float8_e4m3fn,
+        atol=1e-3,
+        group_size=128,
+    )
+
+
 def _batched_fused_marlin_moe_cases() -> list[Any]:
     cases = [
         pytest.param(
@@ -1612,6 +1673,7 @@ def test_batched_fused_marlin_moe(
     quant_dtype: ScalarType,
     input_type: ScalarType | None,
     atol: float,
+    group_size: int = 32,
 ):
     print(
         f"testing m={m}, n={n}, k={k}, e={e}, "
@@ -1621,7 +1683,6 @@ def test_batched_fused_marlin_moe(
     )
     set_random_seed(0)
 
-    group_size = 32
     if input_type == scalar_types.int8:
         input_dtype = torch.int8
     elif input_type == scalar_types.float8_e4m3fn:

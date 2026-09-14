@@ -384,6 +384,170 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
 
 
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (None, None),
+        ("num_rows", 63),
+        ("_vocab_parallel_greedy_supported", False),
+        ("parallel_config.tensor_parallel_size", 1),
+        ("parallel_config.pipeline_parallel_size", 2),
+        ("broadcast_pp_output", True),
+        ("speculative_config", object()),
+        ("lora_config", object()),
+        ("scheduler.has_structured_output_requests", True),
+        ("model.supports_vocab_parallel_greedy", False),
+        ("metadata.all_greedy", False),
+        ("metadata.max_num_logprobs", 0),
+        ("metadata.logprob_token_ids", {0: [1]}),
+        ("metadata.no_penalties", False),
+        ("metadata.allowed_token_ids_mask", object()),
+        ("metadata.bad_words_token_ids", {0: [[1]]}),
+        (
+            "metadata.thinking_budget_state_holder",
+            SimpleNamespace(has_tracked_requests=lambda: True),
+        ),
+        ("bias.biases", {0: {1: 3.0}}),
+        ("minimum.min_toks", {0: object()}),
+        ("metadata.logitsprocs.non_argmax_invariant", [object()]),
+        ("params.prompt_logprobs", 0),
+        ("request.sampling_params", None),
+        ("nan_reporting", True),
+    ],
+)
+def test_vocab_parallel_greedy_preserves_sampling_features(monkeypatch, path, value):
+    """Only unconstrained greedy can skip full-vocabulary sampling."""
+    from vllm.v1.sample.logits_processor.builtin import (
+        LogitBiasLogitsProcessor,
+        MinTokensLogitsProcessor,
+    )
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._vocab_parallel_greedy_supported = True
+    runner.parallel_config = SimpleNamespace(
+        tensor_parallel_size=2, pipeline_parallel_size=1
+    )
+    runner.broadcast_pp_output = False
+    runner.speculative_config = runner.lora_config = None
+    runner.model = SimpleNamespace(supports_vocab_parallel_greedy=True)
+    bias = object.__new__(LogitBiasLogitsProcessor)
+    bias.biases = {}
+    minimum = object.__new__(MinTokensLogitsProcessor)
+    minimum.min_toks = {}
+    metadata = SamplingMetadata(
+        temperature=None,
+        all_greedy=True,
+        all_random=False,
+        top_p=None,
+        top_k=None,
+        generators={},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.empty(0),
+        presence_penalties=torch.empty(0),
+        repetition_penalties=torch.empty(0),
+        output_token_ids=[[]],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=SimpleNamespace(non_argmax_invariant=[bias, minimum]),
+    )
+    params = SamplingParams(temperature=0)
+    runner.input_batch = SimpleNamespace(sampling_metadata=metadata, req_ids=["a"])
+    runner.requests = {"a": SimpleNamespace(sampling_params=params)}
+    runner.request = runner.requests["a"]
+    runner.metadata, runner.bias, runner.minimum, runner.params = (
+        metadata,
+        bias,
+        minimum,
+        params,
+    )
+    runner.scheduler = SimpleNamespace(has_structured_output_requests=False)
+    runner.num_rows = 64
+    monkeypatch.setattr(
+        gpu_model_runner_module.envs,
+        "VLLM_COMPUTE_NANS_IN_LOGITS",
+        path == "nan_reporting",
+    )
+    if path is not None and path != "nan_reporting":
+        obj = runner
+        *parents, key = path.split(".")
+        for parent in parents:
+            obj = getattr(obj, parent)
+        setattr(obj, key, value)
+    assert runner._can_use_vocab_parallel_greedy(runner.scheduler, runner.num_rows) is (
+        path is None
+    )
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("late_grammar", [False, True])
+def test_sample_tokens_consumes_greedy_ids_or_recomputes_for_grammar(
+    monkeypatch, late_grammar
+):
+    """Real IDs retain bookkeeping; a late mask must still constrain sampling."""
+    from vllm.v1.outputs import SamplerOutput
+    from vllm.v1.worker.gpu_model_runner import ExecuteModelState
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    hidden = torch.zeros(1, 4)
+    selected = torch.tensor([[2]], dtype=torch.int32)
+    logits = torch.tensor([[0.0, 1.0, 2.0, 0.0]])
+    scheduler = SimpleNamespace(total_num_scheduled_tokens=1)
+    runner.execute_model_state = ExecuteModelState(
+        scheduler, None, None, None, hidden, hidden, None, None, None, None, selected
+    )
+    runner.input_batch = SimpleNamespace(update_async_output_token_ids=Mock())
+    runner.model = SimpleNamespace(compute_logits=Mock(return_value=logits))
+    runner.use_async_scheduling = False
+    runner.speculative_config = None
+    runner.kv_connector_output = None
+    runner.supports_mm_inputs = runner.routed_experts_initialized = False
+    runner._update_states_after_model_execute = Mock()
+    runner.eplb_step = Mock()
+
+    def apply_mask(sched, grammar, batch, actual_logits):
+        assert actual_logits is logits
+        actual_logits[:, 2] = -float("inf")
+
+    def sample(actual_logits, spec):
+        assert actual_logits is logits and spec is None
+        return SamplerOutput(
+            actual_logits.argmax(-1).to(torch.int32).unsqueeze(-1), None
+        )
+
+    runner._sample = Mock(side_effect=sample)
+    monkeypatch.setattr(gpu_model_runner_module, "apply_grammar_bitmask", apply_mask)
+
+    def bookkeep(sched, sample_output, actual_logits, hidden_states, count):
+        assert sample_output.sampled_token_ids.dtype == torch.int32
+        assert sample_output.sampled_token_ids.tolist() == (
+            [[1]] if late_grammar else [[2]]
+        )
+        assert (actual_logits is logits) if late_grammar else (actual_logits is None)
+        return (
+            {},
+            None,
+            None,
+            sample_output.sampled_token_ids.tolist(),
+            {},
+            ["a"],
+            {"a": 0},
+            [],
+        )
+
+    runner._bookkeeping_sync = bookkeep
+    output = runner.sample_tokens(object() if late_grammar else None)
+    assert output.sampled_token_ids == ([[1]] if late_grammar else [[2]])
+    assert runner.execute_model_state is None
+    assert runner.model.compute_logits.call_count == int(late_grammar)
+    assert runner._sample.call_count == int(late_grammar)
+    assert runner.input_batch.update_async_output_token_ids.call_count == int(
+        not late_grammar
+    )
+
+
 def test_select_common_block_size_no_valid_option():
     backend_a = _make_mock_backend_for_kernel_block_size([64])
     backend_b = _make_mock_backend_for_kernel_block_size([MultipleOf(16)])

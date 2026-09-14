@@ -203,6 +203,7 @@ def select_wna16_moe_backend(
     may_have_zp: bool,
     may_have_bias: bool,
     allow_tile_padding: bool = False,
+    input_dtype: torch.dtype | None = None,
 ) -> tuple[WNA16MoEBackend, type[mk.FusedMoEExperts]]:
     """Select the WNA16 MoE backend.
 
@@ -213,6 +214,7 @@ def select_wna16_moe_backend(
         quant_config: Quantization structure and checkpoint format description.
         may_have_zp: Whether the integration can provide weight zero points.
         may_have_bias: Whether the integration can provide expert bias.
+        input_dtype: Optional activation dtype quantized inside Marlin experts.
 
     Returns:
         A tuple of (``WNA16MoEBackend``, experts class or ``None``).
@@ -225,7 +227,8 @@ def select_wna16_moe_backend(
     )
 
     def _make_log_backend(backend: WNA16MoEBackend):
-        return f"Using '{backend.value}' WNA16 MoE backend."
+        scheme = "W4A8-FP8" if input_dtype == torch.float8_e4m3fn else "WNA16"
+        return f"Using '{backend.value}' {scheme} MoE backend."
 
     def _make_log_unsupported(backend: WNA16MoEBackend, reason: str | None) -> str:
         if reason:
@@ -256,9 +259,15 @@ def select_wna16_moe_backend(
         raise ValueError(_make_log_unsupported(backend, reason))
 
     # Handle explicit moe_backend from user.
+    marlin_backends = [WNA16MoEBackend.MARLIN, WNA16MoEBackend.BATCHED_MARLIN]
     runner_backend = config.moe_backend
     if runner_backend != "auto":
         requested_backend = map_wna16_backend(runner_backend)
+        if input_dtype is not None and requested_backend not in marlin_backends:
+            raise ValueError(
+                f"MoE with {input_dtype} activations requires moe_backend='marlin', "
+                f"got '{runner_backend}'."
+            )
         reason = _backend_incompatibility_reason(
             requested_backend,
             config,
@@ -274,7 +283,9 @@ def select_wna16_moe_backend(
         )
 
     # Select kernels in order of backend.
-    AVAILABLE_BACKENDS = _get_priority_backends()
+    AVAILABLE_BACKENDS = (
+        marlin_backends if input_dtype is not None else _get_priority_backends()
+    )
 
     for backend in AVAILABLE_BACKENDS:
         reason = _backend_incompatibility_reason(
@@ -364,6 +375,7 @@ def make_wna16_moe_kernel(
     w13_g_idx_sort_indices: torch.Tensor | None = None,
     w2_g_idx_sort_indices: torch.Tensor | None = None,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    input_dtype: torch.dtype | None = None,
 ) -> mk.FusedMoEKernel:
     from vllm.model_executor.layers.fused_moe.all2all_utils import (
         maybe_make_prepare_finalize,
@@ -416,6 +428,7 @@ def make_wna16_moe_kernel(
             "w13_g_idx_sort_indices": w13_g_idx_sort_indices,
             "w2_g_idx_sort_indices": w2_g_idx_sort_indices,
             "is_k_full": is_k_full,
+            "input_dtype": input_dtype,
         }
 
     if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:

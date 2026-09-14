@@ -141,6 +141,15 @@ QUANT_CONFIGS = [
         "thread_m_blocks": [1, 2, 3, 4],
         "group_blocks": [-1, 2, 4, 8],
     },
+    # Single-token SM89 W4/FP8 with the transposed MMA layout.
+    {
+        "a_type": ["kFE4M3fn"],
+        "b_type": "kU4B8",
+        "c_type": ["kBFloat16"],
+        "thread_configs": [(128, 64, 128), (64, 128, 128)],
+        "thread_m_blocks": [0.5],
+        "group_blocks": [8],
+    },
     # AWQ-INT4 with FP8 activation
     {
         "a_type": ["kFE4M3fn"],
