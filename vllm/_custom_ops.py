@@ -2399,6 +2399,9 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "fp32_router_gemm"):
         return
 
 
+_H20_NATIVE_TOPK_ENABLED = False
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -2408,6 +2411,37 @@ def topk_softmax(
     e_score_correction_bias: torch.Tensor | None = None,
     is_padding: torch.Tensor | None = None,
 ) -> None:
+    if (
+        _H20_NATIVE_TOPK_ENABLED
+        and e_score_correction_bias is None
+        and is_padding is None
+        and gating_output.is_cuda
+        and gating_output.dtype == torch.bfloat16
+        and gating_output.ndim == 2
+        and gating_output.shape[1] == 256
+        and 1 <= gating_output.shape[0] <= 256
+        and gating_output.is_contiguous()
+        and gating_output.storage_offset() % 8 == 0
+        and topk_weights.shape == (gating_output.shape[0], 8)
+        and topk_ids.shape == topk_weights.shape
+        and token_expert_indices.shape == topk_weights.shape
+        and topk_weights.dtype == torch.float32
+        and topk_ids.dtype in (torch.int32, torch.int64)
+        and token_expert_indices.dtype == torch.int32
+        and topk_weights.is_contiguous()
+        and topk_ids.is_contiguous()
+        and token_expert_indices.is_contiguous()
+    ):
+        torch.ops.h20_topk.run(
+            gating_output,
+            topk_weights,
+            topk_ids,
+            token_expert_indices,
+            renormalize,
+            4,
+            True,
+        )
+        return
     torch.ops._moe_C.topk_softmax(
         topk_weights,
         topk_ids,

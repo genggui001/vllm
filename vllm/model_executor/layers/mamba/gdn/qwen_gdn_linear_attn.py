@@ -179,7 +179,7 @@ def fi_chunk_gated_delta_rule(
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
 ):
-    from flashinfer.gdn_prefill import (
+    from vllm.model_executor.layers.mamba.ops.h20_gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
     )
 

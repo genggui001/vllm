@@ -1148,9 +1148,20 @@ def run_cutlass_moe_w4a8_fp8(
     permute_scratch: MoEPermuteScratch | None,
     *,
     activation_config: ApplyMoEActivationConfig | None = None,
+    use_h20_decode_schedule: bool = False,
 ):
     a1q = hidden_states
     M = a1q.size(0)
+    use_raw_prepare = (
+        use_h20_decode_schedule
+        and 1 <= M <= 16
+        and a1q.dtype == torch.bfloat16
+        and a1q_scale is None
+        and expert_map is None
+        and permute_scratch is not None
+    )
+    if a1q.dtype == torch.bfloat16 and use_h20_decode_schedule and not use_raw_prepare:
+        a1q, a1q_scale = ops.scaled_fp8_quant(a1q, use_per_token_if_dynamic=True)
     local_E = w1.size(0)
     device = a1q.device
     _, K, N_packed = w2.shape
@@ -1167,7 +1178,7 @@ def run_cutlass_moe_w4a8_fp8(
     assert w1_chan_scale.dtype == torch.float32
     assert w2_chan_scale.dtype == torch.float32
     assert w1.size(0) == w2.size(0), "Weights expert number mismatch"
-    assert a1q_scale is not None
+    assert a1q_scale is not None or use_raw_prepare
     assert a2_scale is None
     assert out_dtype in [torch.bfloat16], f"Invalid output dtype: {out_dtype}"
     if expert_map is not None:
@@ -1189,80 +1200,302 @@ def run_cutlass_moe_w4a8_fp8(
         workspace13.view(dtype=torch.float8_e4m3fn), (M * topk, N)
     )
     mm2_out = _resize_cache(workspace2, (M * topk, K))
+    use_fused_activation = (
+        use_h20_decode_schedule
+        and 0 < M <= 256
+        and N == 256
+        and activation == MoEActivation.SILU
+        and expert_map is None
+        and (activation_config is None or activation_config.clamp_limit is None)
+    )
+    if use_fused_activation:
+        # FC1 output aliases the old quant_out. Separate storage prevents a
+        # compressed FP8 output row from overwriting another CTA's BF16 input.
+        quant_out = torch.empty((M * topk, N), device=device, dtype=torch.float8_e4m3fn)
 
-    problem_sizes1 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
-    problem_sizes2 = torch.empty((local_E, 3), dtype=torch.int32, device=device)
-
+    use_prepared = (
+        use_h20_decode_schedule
+        and 0 < M <= 256
+        and (M <= 128 or topk_ids.dtype == torch.int32)
+        and expert_map is None
+        and permute_scratch is not None
+    )
+    use_fc2_fusion = (
+        use_prepared
+        and use_fused_activation
+        and M == 1
+        and (local_E, K, N, topk) == (256, 2048, 256, 8)
+    )
+    use_slot_groups = use_raw_prepare and M in (8, 16)
+    groups = (
+        M * topk if use_slot_groups else (8 if use_prepared and M == 1 else local_E)
+    )
+    problem_sizes1 = torch.empty((groups, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((groups, 3), dtype=torch.int32, device=device)
     num_expert = global_num_experts if expert_map is None else expert_map.size(0)
-    # permuted a1q reuses workspace2
-    a1q, a1q_scale, expert_first_token_offset, inv_perm, _ = moe_permute(
-        a1q,
-        a1q_scale,
-        topk_ids,
-        num_expert,
-        local_E,
-        expert_map,
-        permuted_hidden_states=a1q_perm,
-        scratch=permute_scratch,
-    )
-    # for RS gemm SwapAB is always enabled (swap logical M, N in the problem shape).
-    ops.get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
-        expert_first_token_offset, problem_sizes1, problem_sizes2, N, K, True
-    )
+    if use_prepared or use_fused_activation:
+        a2q_scale = torch.empty((M * topk, 1), device=device, dtype=torch.float32)
+    if use_prepared:
+        from vllm.model_executor.layers.fused_moe.h20_fp8_prepare import (
+            fused_fp8_prepare,
+        )
+
+        ptrs1 = torch.empty((6, groups), device=device, dtype=torch.int64)
+        ptrs2 = torch.empty_like(ptrs1)
+        if use_raw_prepare:
+            a1q_scale = torch.empty((M * topk, 1), dtype=torch.float32, device=device)
+            expert_first_token_offset = permute_scratch.expert_first_token_offset
+            inv_perm = permute_scratch.inv_permuted_idx[: M * topk]
+            prepare_op = (
+                torch.ops.h20_compact_fp8.run
+                if M == 1
+                else (
+                    torch.ops.h20_batch_fp8_groups.run
+                    if use_slot_groups
+                    else torch.ops.h20_batch_fp8.run
+                )
+            )
+            prepare_op(
+                a1q,
+                topk_ids,
+                a1q_perm,
+                a1q_scale,
+                expert_first_token_offset,
+                inv_perm,
+                permute_scratch.permuted_idx[: M * topk],
+                quant_out,
+                a2q_scale,
+                mm1_out,
+                mm2_out,
+                w1,
+                w2,
+                w1_chan_scale,
+                w2_chan_scale,
+                w1_scale,
+                w2_scale,
+                ptrs1,
+                ptrs2,
+                problem_sizes1,
+                problem_sizes2,
+                8 if M == 1 else 256,
+            )
+            a1q = a1q_perm
+        else:
+            a1q, a1q_scale, expert_first_token_offset, inv_perm, _ = fused_fp8_prepare(
+                a1q,
+                a1q_scale,
+                topk_ids,
+                a1q_perm,
+                permute_scratch,
+                quant_out,
+                a2q_scale,
+                mm1_out,
+                mm2_out,
+                w1,
+                w2,
+                w1_chan_scale,
+                w2_chan_scale,
+                w1_scale,
+                w2_scale,
+                ptrs1,
+                ptrs2,
+                problem_sizes1,
+                problem_sizes2,
+            )
+    else:
+        a1q, a1q_scale, expert_first_token_offset, inv_perm, _ = moe_permute(
+            a1q,
+            a1q_scale,
+            topk_ids,
+            num_expert,
+            local_E,
+            expert_map,
+            permuted_hidden_states=a1q_perm,
+            scratch=permute_scratch,
+        )
+        ops.get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
+            expert_first_token_offset, problem_sizes1, problem_sizes2, N, K, True
+        )
     expert_offsets = expert_first_token_offset[:-1]
 
-    ops.cutlass_w4a8_moe_mm(
-        mm1_out,
-        a1q,
-        w1,
-        a1q_scale,
-        w1_chan_scale,
-        w1_scale,
-        group_size,
-        expert_offsets,
-        problem_sizes1,
-        a_strides1,
-        b_strides1,
-        c_strides1,
-        s_strides1,
+    small_batch = use_h20_decode_schedule and 0 < M <= 256
+    short_prefill = (
+        use_h20_decode_schedule
+        and 257 <= M <= 512
+        and expert_map is None
+        and (local_E, K, N, topk) == (256, 2048, 256, 8)
     )
+    fc1_schedule = "Kernel_256x32_1x1x1_Coop" if short_prefill else None
+    if small_batch:
+        fc1_schedule = (
+            "Kernel_128x16_1x1x1_Coop" if M <= 16 else "Kernel_256x16_1x1x1_Coop"
+        )
 
-    apply_moe_activation(
-        activation,
-        act_out,
-        mm1_out,
-        activation_config=activation_config,
-    )
+    if use_prepared:
+        if 8 <= M <= 16:
+            fc1_op = torch.ops.h20_native_resources.mm
+        elif M == 1:
+            fc1_op = torch.ops.h20_native_pingpong_n8.mm
+        elif M <= 8:
+            fc1_op = torch.ops.h20_native_prepared_n8.mm
+        else:
+            fc1_op = (
+                torch.ops.h20_native_pingpong.mm
+                if M >= 64
+                else torch.ops.h20_native_prepared.mm
+            )
+        fc1_op(
+            mm1_out,
+            a1q,
+            w1,
+            a1q_scale,
+            w1_chan_scale,
+            w1_scale,
+            group_size,
+            expert_offsets,
+            problem_sizes1,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            s_strides1,
+            ptrs1,
+            4 if 8 <= M <= 16 else (64 if M == 1 else (128 if M <= 16 else 256)),
+        )
+    else:
+        ops.cutlass_w4a8_moe_mm(
+            mm1_out,
+            a1q,
+            w1,
+            a1q_scale,
+            w1_chan_scale,
+            w1_scale,
+            group_size,
+            expert_offsets,
+            problem_sizes1,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            s_strides1,
+            maybe_schedule=fc1_schedule,
+        )
 
-    a2q, a2q_scale = ops.scaled_fp8_quant(
-        act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
-    )
+    if use_fc2_fusion:
+        torch.ops.h20_fused_fc2_encoded.run(
+            mm2_out,
+            mm1_out,
+            quant_out,
+            w2,
+            a2q_scale,
+            w2_chan_scale,
+            w2_scale,
+            problem_sizes2,
+            ptrs2,
+            True,
+        )
+    else:
+        if use_fused_activation:
+            a2q = quant_out
+            torch.ops.h20_silu_fp8.run(a2q, mm1_out, a2q_scale, act_out, False)
+        else:
+            apply_moe_activation(
+                activation,
+                act_out,
+                mm1_out,
+                activation_config=activation_config,
+            )
+            if use_prepared:
+                a2q = quant_out
+                torch.ops._C.dynamic_per_token_scaled_fp8_quant(
+                    a2q, act_out, a2q_scale, None
+                )
+            else:
+                a2q, a2q_scale = ops.scaled_fp8_quant(
+                    act_out,
+                    a2_scale,
+                    use_per_token_if_dynamic=per_act_token,
+                    output=quant_out,
+                )
 
-    ops.cutlass_w4a8_moe_mm(
-        mm2_out,
-        a2q,
-        w2,
-        a2q_scale,
-        w2_chan_scale,
-        w2_scale,
-        group_size,
-        expert_offsets,
-        problem_sizes2,
-        a_strides2,
-        b_strides2,
-        c_strides2,
-        s_strides2,
-    )
+        if use_prepared:
+            if 8 <= M <= 32:
+                fc2_op = torch.ops.h20_native_resources.mm
+            elif 33 <= M <= 63:
+                fc2_op = torch.ops.h20_native_staged.mm
+            elif M <= 8:
+                fc2_op = torch.ops.h20_native_prepared_n8.mm
+            else:
+                fc2_op = (
+                    torch.ops.h20_native_pingpong.mm
+                    if M >= 64
+                    else torch.ops.h20_native_prepared.mm
+                )
+            fc2_op(
+                mm2_out,
+                a2q,
+                w2,
+                a2q_scale,
+                w2_chan_scale,
+                w2_scale,
+                group_size,
+                expert_offsets,
+                problem_sizes2,
+                a_strides2,
+                b_strides2,
+                c_strides2,
+                s_strides2,
+                ptrs2,
+                (
+                    (8 if M <= 16 else 13)
+                    if 8 <= M <= 32
+                    else (16 if 33 <= M <= 63 else 256)
+                ),
+            )
+        else:
+            ops.cutlass_w4a8_moe_mm(
+                mm2_out,
+                a2q,
+                w2,
+                a2q_scale,
+                w2_chan_scale,
+                w2_scale,
+                group_size,
+                expert_offsets,
+                problem_sizes2,
+                a_strides2,
+                b_strides2,
+                c_strides2,
+                s_strides2,
+                maybe_schedule=(
+                    "Kernel_256x32_1x1x1_Coop"
+                    if short_prefill
+                    else ("Kernel_256x16_1x1x1_Coop" if small_batch else None)
+                ),
+            )
 
     # for non-chunking mode the output is resized from workspace13
     # so we need to make sure mm2_out uses workspace2.
-    moe_unpermute(
-        out=output,
-        permuted_hidden_states=mm2_out,
-        topk_weights=topk_weights,
-        inv_permuted_idx=inv_perm,
-        expert_first_token_offset=expert_first_token_offset,
-    )
+    if use_fused_activation:
+        finalize_op = (
+            torch.ops.h20_prefetch_finalize.run
+            if M <= 128
+            else torch.ops.h20_unrolled_finalize.run
+        )
+        finalize_op(
+            output,
+            mm2_out,
+            topk_weights,
+            inv_perm,
+            expert_first_token_offset,
+            4 if M <= 128 else 2,
+        )
+    else:
+        moe_unpermute(
+            out=output,
+            permuted_hidden_states=mm2_out,
+            topk_weights=topk_weights,
+            inv_permuted_idx=inv_perm,
+            expert_first_token_offset=expert_first_token_offset,
+        )
 
 
 class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
@@ -1282,6 +1515,33 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
         device = moe_config.device
 
         self.out_dtype = moe_config.in_dtype
+        self._use_h20_decode_schedule = (
+            "H20" in current_platform.get_device_name().split()
+            and all(
+                hasattr(getattr(torch.ops, namespace), name)
+                for namespace, name in (
+                    ("h20_batch_fp8", "run"),
+                    ("h20_batch_fp8_groups", "run"),
+                    ("h20_compact_fp8", "run"),
+                    ("h20_fused_fc2_encoded", "run"),
+                    ("h20_native_pingpong", "mm"),
+                    ("h20_native_pingpong_n8", "mm"),
+                    ("h20_native_prepared", "mm"),
+                    ("h20_native_prepared_n8", "mm"),
+                    ("h20_native_resources", "mm"),
+                    ("h20_native_staged", "mm"),
+                    ("h20_prefetch_finalize", "run"),
+                    ("h20_silu_fp8", "run"),
+                    ("h20_topk", "run"),
+                    ("h20_unrolled_finalize", "run"),
+                )
+            )
+            and moe_config.num_experts == e
+            and (e, k, n, moe_config.experts_per_token) == (256, 2048, 256, 8)
+        )
+
+        if self._use_h20_decode_schedule:
+            ops._H20_NATIVE_TOPK_ENABLED = True
 
         a_strides1_c_strides2 = torch.full((e,), k, device=device, dtype=torch.int64)
         self.a_strides1 = a_strides1_c_strides2
@@ -1300,6 +1560,15 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
 
         self.group_size = group_size
         self._permute_scratch: MoEPermuteScratch | None = None
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        return (
+            self._use_h20_decode_schedule
+            and self.quant_config.a1_scale is None
+            and self.moe_config.moe_parallel_config.dp_size == 1
+            and self.moe_config.moe_parallel_config.ep_size == 1
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -1449,4 +1718,5 @@ class CutlassExpertsW4A8Fp8(mk.FusedMoEExpertsModular):
             self.group_size,
             self._get_permute_scratch(),
             activation_config=self.activation_config,
+            use_h20_decode_schedule=self._use_h20_decode_schedule,
         )

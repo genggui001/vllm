@@ -1451,6 +1451,8 @@ define_extension_target(
   USE_SABI 3
   WITH_SOABI)
 
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/h20_w4a8.cmake)
+
 # Set TORCH_TARGET_VERSION for stable ABI compatibility.
 # This ensures we only use C-shim APIs available in PyTorch 2.11.
 # _moe_C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
