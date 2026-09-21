@@ -9,6 +9,22 @@ from vllm.triton_utils import tl, triton
 
 
 @triton.jit
+def _normalize_padding_ids_kernel(IDS, OUT, ROWS: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ids = tl.load(IDS + offsets, offsets < ROWS, other=256)
+    tl.store(OUT + offsets, tl.where(ids < 0, 256, ids), offsets < ROWS)
+
+
+def normalize_padding_ids(ids: torch.Tensor, scratch) -> torch.Tensor:
+    """Adapt V2 padding to the generic CUB sort without changing router IDs."""
+    output = scratch.topk_ids_for_sort[: ids.numel()].view_as(ids)
+    _normalize_padding_ids_kernel[(triton.cdiv(ids.numel(), 256),)](
+        ids, output, ids.numel(), 256
+    )
+    return output
+
+
+@triton.jit
 def _store_group(
     PTR1,
     PTR2,

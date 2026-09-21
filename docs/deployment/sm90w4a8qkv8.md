@@ -29,6 +29,11 @@ quantization, and FC2. The release retains these useful schedules and necessary
 fallbacks; unused experimental implementations and runtime source loaders are
 excluded.
 
+V2 Model Runner padding uses expert ID -1. Prepared kernels handle this inside
+their existing metadata loads. Larger batches using the generic CUB fallback
+normalize padding IDs in a reused scratch buffer before sorting; original router
+IDs remain unchanged. CUDA Graph replay is supported for changing padding masks.
+
 For the tested model:
 
 ```bash
@@ -43,7 +48,10 @@ vllm serve "$MODEL" \
 
 `--moe-backend cutlass --attention-backend FLASH_ATTN` can select the existing
 backends explicitly. On the tested H20 configuration, FlashAttention selects
-FA3. `OMP_NUM_THREADS` remains under the caller's control. No `H20_USE_SOURCE`,
+FA3. When using MTP, keep `--moe-backend auto`: its unquantized MoE must use
+the appropriate separate backend. Upstream v0.29 disables cascade attention
+with asynchronous speculative decoding; `--no-async-scheduling` is needed to
+allow cascade with MTP. `OMP_NUM_THREADS` remains under the caller's control. No `H20_USE_SOURCE`,
 `H20_SOURCE_ROOT`, or custom `sitecustomize.py` is needed for normal serving.
 
 ## Reproducible component build and complete wheel
@@ -54,7 +62,7 @@ CUTLASS 4.5.0 headers bundled with that FlashInfer package and GCC 11.4.
 
 The recipe recompiles the **complete MoE extension**, including the selected
 SM90a kernels. Unchanged upstream libraries, including FA3, and vendored package
-assets are reused from the unmodified vLLM 0.29.0 installation. This is a complete
+assets are reused from the unmodified official CUDA 13.0 vLLM 0.29.0 installation. This is a complete
 installable wheel, not a claim that every upstream extension was recompiled.
 
 Use an existing environment with these dependencies and commit the release

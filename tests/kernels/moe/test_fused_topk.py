@@ -326,3 +326,44 @@ def test_h20_topk_padding_graph_replay(
         for reference, result in zip(expected, actual):
             assert torch.equal(reference.view(torch.uint8), result.view(torch.uint8))
         assert (actual[1][padding] == -1).all()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_tokens", [129, 257, 512, 8192])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@torch.inference_mode()
+def test_h20_fallback_padding_ids_graph_replay(num_tokens, index_dtype):
+    """Large-batch padding sorts after valid experts without mutating routing."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.fused_moe.h20_fp8_prepare import (
+        normalize_padding_ids,
+    )
+
+    ids = (
+        torch.arange(num_tokens * 8, device="cuda", dtype=index_dtype).view(-1, 8) % 256
+    )
+    scratch = SimpleNamespace(
+        topk_ids_for_sort=torch.empty_like(ids, dtype=torch.int32).flatten()
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        normalize_padding_ids(ids, scratch)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        result = normalize_padding_ids(ids, scratch)
+    for mode in ("all", "alternating", "none"):
+        ids.copy_(torch.arange(ids.numel(), device="cuda").view_as(ids) % 256)
+        if mode == "all":
+            ids.fill_(-1)
+        elif mode == "alternating":
+            ids[::2] = -1
+            ids[1::2, ::2] = 256
+        before = ids.clone()
+        expected = torch.where(ids < 0, 256, ids).to(torch.int32)
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.equal(result, expected)
+        assert torch.equal(ids, before)

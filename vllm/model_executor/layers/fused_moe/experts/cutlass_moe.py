@@ -1304,6 +1304,18 @@ def run_cutlass_moe_w4a8_fp8(
                 problem_sizes2,
             )
     else:
+        if (
+            use_h20_decode_schedule
+            and expert_map is None
+            and permute_scratch is not None
+        ):
+            from vllm.model_executor.layers.fused_moe.h20_fp8_prepare import (
+                normalize_padding_ids,
+            )
+
+            # Generic CUB permutation needs a nonnegative disabled-expert ID.
+            # The prepared decode kernels already do this in their own loads.
+            topk_ids = normalize_padding_ids(topk_ids, permute_scratch)
         a1q, a1q_scale, expert_first_token_offset, inv_perm, _ = moe_permute(
             a1q,
             a1q_scale,
