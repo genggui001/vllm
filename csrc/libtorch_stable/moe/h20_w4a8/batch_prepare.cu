@@ -38,10 +38,14 @@ __global__ void batch_fp8_prepare_kernel(
   const int p = blockIdx.x;
   const int tid = threadIdx.x;
   const bool has_row = p < rows;
-  const int expert = has_row ? static_cast<int>(ids[p]) : 0;
+  // Sort padding after valid experts so offsets[256] remains the
+  // number of active rows, matching the generic MoE contract.
+  const int raw_expert = has_row ? static_cast<int>(ids[p]) : 0;
+  const int expert = raw_expert < 0 ? 256 : raw_expert;
   Stats local{0.f, 0, 0, 0};
   for (int i = tid; i < rows; i += Threads) {
-    const int id = static_cast<int>(ids[i]);
+    const int raw_id = static_cast<int>(ids[i]);
+    const int id = raw_id < 0 ? 256 : raw_id;
     local.start += id < p;
     local.count += id == p;
     local.destination += id < expert || (id == expert && i < p);

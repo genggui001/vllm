@@ -271,3 +271,58 @@ def test_fused_topk_bias_nan_inf_clamp(
             f"Row {row} has non-finite weights {topk_weights[row].tolist()} "
             f"(bad_value={bad_value}, scoring_func={scoring_func})"
         )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or "H20" not in current_platform.get_device_name().split(),
+    reason="Requires the native H20 top-k kernel.",
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 16, 33, 128, 256])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("renormalize", [False, True])
+@torch.inference_mode()
+def test_h20_topk_padding_graph_replay(
+    monkeypatch, num_tokens: int, index_dtype: torch.dtype, renormalize: bool
+):
+    """V2 padding must retain reference weights and -1 IDs after graph replay."""
+    from vllm import _custom_ops as ops
+
+    if not hasattr(torch.ops.h20_topk, "run"):
+        pytest.skip("H20 extension is not built")
+    monkeypatch.setattr(ops, "_H20_NATIVE_TOPK_ENABLED", True)
+    torch.manual_seed(7)
+    scores = torch.randn(num_tokens, 256, device="cuda", dtype=torch.bfloat16)
+    padding = torch.zeros(num_tokens, device="cuda", dtype=torch.bool)
+
+    def outputs():
+        return (
+            torch.empty(num_tokens, 8, device="cuda", dtype=torch.float32),
+            torch.empty(num_tokens, 8, device="cuda", dtype=index_dtype),
+            torch.empty(num_tokens, 8, device="cuda", dtype=torch.int32),
+        )
+
+    actual, expected = outputs(), outputs()
+
+    def run():
+        ops.topk_softmax(*actual, scores, renormalize, is_padding=padding)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    for mode in ("all", "alternating", "none"):
+        scores.normal_()
+        padding.fill_(mode == "all")
+        if mode == "alternating":
+            padding[::2] = True
+        torch.ops._moe_C.topk_softmax(*expected, scores, renormalize, None, padding)
+        graph.replay()
+        torch.accelerator.synchronize()
+        for reference, result in zip(expected, actual):
+            assert torch.equal(reference.view(torch.uint8), result.view(torch.uint8))
+        assert (actual[1][padding] == -1).all()

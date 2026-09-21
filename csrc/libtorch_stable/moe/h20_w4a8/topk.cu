@@ -18,6 +18,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <optional>
 #include <type_traits>
 
 #include <cuda_runtime.h>
@@ -60,8 +61,8 @@ struct alignas(Alignment) AlignedArray {
 template <int Warps, typename Index>
 __launch_bounds__(Warps * 32) __global__
     void register_topk(const __nv_bfloat16* input, float* weights,
-                       Index* indices, int* sources, int rows,
-                       bool renormalize) {
+                       Index* indices, int* sources, int rows, bool renormalize,
+                       const bool* is_padding) {
   const int lane = threadIdx.x;
   const int row = blockIdx.x * Warps + threadIdx.y;
   if (row >= rows) return;
@@ -139,7 +140,9 @@ __launch_bounds__(Warps * 32) __global__
   if (renormalize) scale /= selected_sum > 0.0f ? selected_sum : 1.0f;
   if (lane < 8) {
     weights[row * 8 + lane] = saved_weight * scale;
-    indices[row * 8 + lane] = static_cast<Index>(saved_expert);
+    indices[row * 8 + lane] = is_padding != nullptr && is_padding[row]
+                                  ? static_cast<Index>(-1)
+                                  : static_cast<Index>(saved_expert);
     sources[row * 8 + lane] = lane * rows + row;
   }
 }
@@ -150,7 +153,7 @@ using Type = torch::headeronly::ScalarType;
 template <int Warps, typename Index>
 void launch(const Tensor& input, Tensor& weights, Tensor& indices,
             Tensor& sources, bool renormalize, bool registers,
-            cudaStream_t stream) {
+            cudaStream_t stream, const bool* is_padding) {
   const int rows = input.size(0);
   const dim3 block(32, Warps);
   const int grid = (rows + Warps - 1) / Warps;
@@ -158,11 +161,13 @@ void launch(const Tensor& input, Tensor& weights, Tensor& indices,
       reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
       reinterpret_cast<float*>(weights.data_ptr()),
       reinterpret_cast<Index*>(indices.data_ptr()),
-      reinterpret_cast<int*>(sources.data_ptr()), rows, renormalize);
+      reinterpret_cast<int*>(sources.data_ptr()), rows, renormalize,
+      is_padding);
 }
 
 void run(const Tensor& input, Tensor& weights, Tensor& indices, Tensor& sources,
-         bool renormalize, int64_t warps, bool registers) {
+         bool renormalize, int64_t warps, bool registers,
+         std::optional<Tensor> is_padding) {
   STD_TORCH_CHECK(input.is_cuda() && input.is_contiguous() && input.dim() == 2);
   STD_TORCH_CHECK(input.size(1) == 256 && input.size(0) > 0 &&
                   input.size(0) <= 256);
@@ -179,22 +184,32 @@ void run(const Tensor& input, Tensor& weights, Tensor& indices, Tensor& sources,
                   indices.scalar_type() == Type::Long);
   STD_TORCH_CHECK(warps == 4 && registers,
                   "H20 Top-k supports the selected four-warp kernel");
+  const bool* padding_ptr = nullptr;
+  if (is_padding.has_value()) {
+    const auto& padding = is_padding.value();
+    STD_TORCH_CHECK(padding.device() == input.device() &&
+                    padding.scalar_type() == Type::Bool &&
+                    padding.is_contiguous() && padding.dim() == 1 &&
+                    padding.size(0) == input.size(0));
+    padding_ptr = padding.const_data_ptr<bool>();
+  }
   const auto device = input.device().index();
   const torch::stable::accelerator::DeviceGuard guard(device);
   auto stream = get_current_cuda_stream(device);
   if (indices.scalar_type() == Type::Int) {
     launch<4, int32_t>(input, weights, indices, sources, renormalize, registers,
-                       stream);
+                       stream, padding_ptr);
   } else {
     launch<4, int64_t>(input, weights, indices, sources, renormalize, registers,
-                       stream);
+                       stream, padding_ptr);
   }
 }
 
 STABLE_TORCH_LIBRARY(h20_topk, m) {
   m.def(
       "run(Tensor input, Tensor! weights, Tensor! indices, Tensor! sources, "
-      "bool renormalize, int warps, bool registers) -> ()");
+      "bool renormalize, int warps, bool registers, Tensor? is_padding=None) "
+      "-> ()");
 }
 STABLE_TORCH_LIBRARY_IMPL(h20_topk, CUDA, m) { m.impl("run", TORCH_BOX(&run)); }
 }  // namespace h20_topk

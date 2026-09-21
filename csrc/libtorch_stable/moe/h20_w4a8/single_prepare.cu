@@ -35,15 +35,17 @@ __global__ void compact_fp8_prepare_kernel(
     for (int expert = tid; expert <= 256; expert += blockDim.x) {
       int start = 0;
 #pragma unroll
-      for (int i = 0; i < TopK; ++i) start += ids[i] < expert;
+      for (int i = 0; i < TopK; ++i) start += ids[i] >= 0 && ids[i] < expert;
       offsets[expert] = start;
     }
     if (tid < TopK) {
-      const int expert_id = static_cast<int>(ids[tid]);
+      const int raw_expert = static_cast<int>(ids[tid]);
+      const int expert_id = raw_expert < 0 ? 256 : raw_expert;
       int destination = 0;
 #pragma unroll
       for (int i = 0; i < TopK; ++i) {
-        const int id = static_cast<int>(ids[i]);
+        const int raw_id = static_cast<int>(ids[i]);
+        const int id = raw_id < 0 ? 256 : raw_id;
         destination += id < expert_id || (id == expert_id && i < tid);
       }
       inv[tid] = destination;

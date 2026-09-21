@@ -2467,7 +2467,6 @@ def topk_softmax(
     if (
         _H20_NATIVE_TOPK_ENABLED
         and e_score_correction_bias is None
-        and is_padding is None
         and gating_output.is_cuda
         and gating_output.dtype == torch.bfloat16
         and gating_output.ndim == 2
@@ -2484,6 +2483,15 @@ def topk_softmax(
         and topk_weights.is_contiguous()
         and topk_ids.is_contiguous()
         and token_expert_indices.is_contiguous()
+        and (
+            is_padding is None
+            or (
+                is_padding.device == gating_output.device
+                and is_padding.dtype == torch.bool
+                and is_padding.shape == (gating_output.shape[0],)
+                and is_padding.is_contiguous()
+            )
+        )
     ):
         torch.ops.h20_topk.run(
             gating_output,
@@ -2493,6 +2501,7 @@ def topk_softmax(
             renormalize,
             4,
             True,
+            is_padding,
         )
         return
     torch.ops._moe_C.topk_softmax(

@@ -96,6 +96,8 @@ def _fused_fp8_permute_prepare_kernel(
     p = tl.program_id(0)
     idx = tl.arange(0, BLOCK_ROWS)
     ids = tl.load(IDS + idx, idx < ROWS, other=2147483647)
+    # V2 padding uses -1; place it after valid experts like the old sentinel.
+    ids = tl.where(ids < 0, 256, ids)
     start = 0
     expert = tl.full((), 0, tl.int32)
     destination = 0
@@ -103,8 +105,9 @@ def _fused_fp8_permute_prepare_kernel(
         start = tl.sum((ids < p).to(tl.int32), 0)
         tl.store(OFFSETS + p, start.to(tl.int64))
     if p < ROWS:
-        # Router IDs are 0..255, or 256 for disabled experts.
+        # Router IDs are 0..255, negative for padding, or 256 for disabled experts.
         expert = tl.load(IDS + p).to(tl.int32)
+        expert = tl.where(expert < 0, 256, expert)
         earlier = (ids < expert) | ((ids == expert) & (idx < p))
         destination = tl.sum(earlier.to(tl.int32), 0)
         tl.store(INV + p, destination)
