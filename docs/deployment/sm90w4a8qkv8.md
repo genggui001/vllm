@@ -49,10 +49,30 @@ vllm serve "$MODEL" \
 `--moe-backend cutlass --attention-backend FLASH_ATTN` can select the existing
 backends explicitly. On the tested H20 configuration, FlashAttention selects
 FA3. When using MTP, keep `--moe-backend auto`: its unquantized MoE must use
-the appropriate separate backend. Upstream v0.29 disables cascade attention
-with asynchronous speculative decoding; `--no-async-scheduling` is needed to
-allow cascade with MTP. `OMP_NUM_THREADS` remains under the caller's control. No `H20_USE_SOURCE`,
+the appropriate separate backend. `OMP_NUM_THREADS` remains under the caller's
+control. No `H20_USE_SOURCE`,
 `H20_SOURCE_ROOT`, or custom `sitecustomize.py` is needed for normal serving.
+
+## Prefix caching, cascade attention, and MTP
+
+Prefix caching and cascade are separate features. Upstream v0.29's default V2
+model runner passes `common_prefix_len=0` to the attention metadata builder,
+so requesting cascade does not make that runner execute it. Prefix caching can
+still hit and reuse cached tokens.
+
+For actual cascade execution, select the upstream V1 runner explicitly:
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=0
+```
+
+Use `--enable-prefix-caching --no-disable-cascade-attn` with the serving command.
+When combining cascade with Qwen3-Next MTP, also use `--no-async-scheduling`:
+upstream separately disables cascade with asynchronous speculative decoding.
+Keep `--moe-backend auto` for MTP's unquantized MoE. The same native H20 operators
+are available with either model runner; this release does not force a runner or
+an OMP thread count. Default-runner speed measurements and V1 cascade tests must
+be labeled separately.
 
 ## Reproducible component build and complete wheel
 
