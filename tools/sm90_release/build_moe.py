@@ -182,8 +182,12 @@ def main():
                 timeout=1200,
             )
         entries = json.loads((build / "compile_commands.json").read_text())
-        selected = [r for r in entries if "/moe/h20_w4a8/" in r["file"]]
-        assert len(selected) == 14
+        selected = [
+            r
+            for r in entries
+            if "/moe/h20_w4a8/" in r["file"] or "/quantization/sm90_g32/" in r["file"]
+        ]
+        assert len(selected) == 21
         for row in selected:
             for flag in [
                 "sm_90a",
@@ -194,6 +198,25 @@ def main():
             ]:
                 assert flag in row["command"], (row["file"], flag)
             assert "--use_fast_math" not in row["command"]
+        linear = next(r for r in selected if r["file"].endswith("linear/linear_g32.cu"))
+        private_include = "/quantization/sm90_g32/linear/include"
+        assert private_include in linear["command"]
+        assert linear["command"].index(private_include) < linear["command"].index(
+            str(cutlass / "include")
+        )
+        for row in selected:
+            if row is not linear:
+                assert private_include not in row["command"]
+        nt32 = next(
+            r for r in selected if r["file"].endswith("linear_nt32/linear_nt32.cu")
+        )
+        private_nt32 = "/quantization/sm90_g32/linear_nt32/include"
+        assert nt32["command"].index(private_nt32) < nt32["command"].index(
+            str(cutlass / "include")
+        )
+        for row in selected:
+            if row is not nt32:
+                assert private_nt32 not in row["command"]
         write(root / "selected-compile-commands.json", selected)
         state["phase"] = "compile"
         write(root / "status.json", state)
@@ -227,7 +250,7 @@ def main():
             exit_code=0,
             library=str(library),
             library_sha256=sha(library),
-            selected_cuda_sources=14,
+            selected_cuda_sources=21,
         )
     except BaseException as error:
         state.update(running=False, exit_code=1, error=repr(error))

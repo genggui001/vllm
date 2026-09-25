@@ -59,6 +59,22 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         input_quant = scheme_dict.get("input_activations")
         format = scheme_dict.get("format")
 
+        from vllm.model_executor.layers.quantization.utils.sm90_g32 import is_g32
+
+        if is_g32(weight_quant, input_quant, weight_bits=4):
+            if (
+                format != "pack-quantized"
+                or scheme_dict.get("output_activations") is not None
+            ):
+                raise ValueError("W4A8 G32 requires pack-quantized INT4 weights")
+            from .compressed_tensors_moe_w4a8_fp8_g32 import (
+                CompressedTensorsW4A8Fp8G32MoEMethod,
+            )
+
+            return CompressedTensorsW4A8Fp8G32MoEMethod(
+                weight_quant, input_quant, layer.moe_config, layer_name
+            )
+
         if quant_config._is_mxfp4(weight_quant):
             from .compressed_tensors_moe_w4a4_mxfp4 import (
                 CompressedTensorsW4A4Mxfp4MoEMethod,

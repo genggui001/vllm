@@ -126,6 +126,7 @@ MoEBackend = Literal[
     "deep_gemm",
     "deep_gemm_mega_moe",
     "cutlass",
+    "cutlass_g32",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
@@ -185,6 +186,7 @@ def validate_flashinfer_moe_ep_model(
 LinearBackend = Literal[
     "auto",
     "cutlass",
+    "cutlass_g32",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
     "flashinfer_trtllm",

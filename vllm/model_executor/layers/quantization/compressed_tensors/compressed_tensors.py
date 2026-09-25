@@ -730,6 +730,22 @@ class CompressedTensorsConfig(QuantizationConfig):
         # use the per-layer format if defined, otherwise, use global format
         format = format if format is not None else self.quant_format
 
+        from vllm.model_executor.layers.quantization.utils.sm90_g32 import is_g32
+
+        if is_g32(weight_quant, input_quant, weight_bits=8):
+            if format != "float-quantized" or output_quant is not None:
+                raise ValueError(
+                    "W8A8 G32 requires float-quantized weights "
+                    "without output quantization"
+                )
+            if weight_quant.scale_dtype != torch.float32:
+                raise ValueError("W8A8 G32 requires original FP32 weight scales")
+            from .schemes.compressed_tensors_w8a8_fp8_g32 import (
+                CompressedTensorsW8A8Fp8G32,
+            )
+
+            return CompressedTensorsW8A8Fp8G32(layer_name)
+
         # Detect If Mixed Precision
         if self._is_nvfp4_format(weight_quant):
             if input_quant is None:
