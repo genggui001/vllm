@@ -25,6 +25,7 @@ from packaging.utils import parse_wheel_filename
 from wheel.wheelfile import WheelFile
 
 PYTHON_FILES = (
+    "vllm/v1/worker/gpu_model_runner.py",
     "vllm/_custom_ops.py",
     "vllm/config/kernel.py",
     "vllm/model_executor/layers/quantization/utils/sm90_g32.py",

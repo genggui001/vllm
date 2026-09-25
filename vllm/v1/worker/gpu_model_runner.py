@@ -4700,6 +4700,12 @@ class GPUModelRunner(
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
+        # The drafter can reuse the target's CUDA Graph memory pool. Preserve
+        # prompt states before drafting so bookkeeping does not read overwritten
+        # graph outputs. Normal generation requests do not need this copy.
+        prompt_hidden_states = hidden_states
+        if spec_config is not None and self.num_prompt_logprobs:
+            prompt_hidden_states = hidden_states.clone()
         draft_after_bookkeeping = False
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
@@ -4802,7 +4808,7 @@ class GPUModelRunner(
                 scheduler_output,
                 sampler_output,
                 logits,
-                hidden_states,
+                prompt_hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
 
