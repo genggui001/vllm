@@ -23,6 +23,20 @@ Marlin's BF16/FP16 tensor-core path. A100 does not execute native FP8 GEMMs.
 Attention stores persistent K/V as E4M3 bytes, applies the checkpoint's static
 Q/K/V scales, and computes FA2 attention in BF16.
 
+## Native-QDQ numerical behavior
+
+The fused expert-input and SwiGLU QDQ paths follow the native CUDA per-token
+E4M3 quantizer: the FP32 scale uses round-to-nearest division by 448 and a
+minimum of `1 / (448 * 512)`. SwiGLU preserves the native signed-zero behavior
+and the input-dtype rounding of its activation and product. Residual values
+are not modified by the deferred Norm+QDQ operation.
+
+For BF16 expert width 256, the SiLU lookup path starts at 2048 expanded expert
+rows and uses one warp. Smaller batches use the direct path; FP16 and other
+widths retain their existing dispatch. This scheduling change preserves the
+same numerical contract. It requires no environment flag or runtime patch;
+automatic backend selection and explicit backend options remain available.
+
 ## Supported configuration
 
 - NVIDIA compute capability 8.0, BF16 decoder attention, head dimension 256.

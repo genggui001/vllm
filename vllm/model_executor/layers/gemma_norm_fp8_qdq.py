@@ -6,6 +6,7 @@ import torch
 
 from vllm.model_executor.layers.fused_moe.experts.marlin_fp8_qdq_fused_moe import (
     _e4m3fn_qdq_software,
+    _fp8_e4m3_dynamic_scale,
 )
 from vllm.triton_utils import tl, triton
 
@@ -40,9 +41,7 @@ def _gemma_norm_qdq_direct_ieee(
     # This BF16 rounding boundary is part of the accepted QDQ contract.
     values = normalized.to(tl.float32)
     values = tl.where(column < C, values, 0.0)
-    scale = tl.maximum(
-        _mul_rn_ieee(tl.max(tl.abs(values), 0), 1.0 / 448.0), 1.1754943508222875e-38
-    )
+    scale = _fp8_e4m3_dynamic_scale(tl.max(tl.abs(values), 0))
     quantized = _mul_rn_ieee(
         _e4m3fn_qdq_software(tl.clamp(tl.div_rn(values, scale), -448.0, 448.0)), scale
     )

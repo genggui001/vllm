@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.experts.marlin_fp8_qdq_fused_moe import (
     MarlinFp8QdqFusedExperts,
     fp8_e4m3_per_token_qdq_fused,
@@ -28,10 +29,8 @@ def test_fused_experts_reject_clamp_instead_of_ignoring_model_config():
 
 
 def fp8_e4m3_per_token_qdq(x: torch.Tensor) -> torch.Tensor:
-    """Independent materialized QAT formula, used only as a test oracle."""
-    scales = x.abs().amax(dim=1, keepdim=True).float() / 448.0
-    scales = scales.clamp_min(torch.finfo(torch.float32).tiny)
-    quantized = (x / scales).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    """Use the native CUDA quantizer as an independent numerical oracle."""
+    quantized, scales = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
     return (quantized.float() * scales).to(x.dtype)
 
 
@@ -66,7 +65,7 @@ def test_fused_per_token_qdq_matches_reference(dtype: torch.dtype, shape):
     expected = fp8_e4m3_per_token_qdq(x)
     actual = fp8_e4m3_per_token_qdq_fused(x)
 
-    assert torch.equal(actual, expected)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -116,12 +115,13 @@ def test_fused_qdq_rejects_output_on_another_device():
         )
 
 
-@pytest.mark.parametrize("width", [896, 2560])
+@pytest.mark.parametrize("width", [256, 896, 2560])
 def test_fused_qdq_graph_replay_matches_fresh_reference(width):
     _require_sm80()
     torch.manual_seed(719)
-    x = torch.randn((257, width * 2), device="cuda", dtype=torch.bfloat16)
-    out = torch.empty((257, width), device="cuda", dtype=torch.bfloat16)
+    rows = 512 if width == 256 else 257
+    x = torch.randn((rows, width * 2), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((rows, width), device="cuda", dtype=torch.bfloat16)
     activation = torch.empty_like(out)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -154,7 +154,7 @@ def test_fused_qdq_all_finite_input_codes(dtype: torch.dtype) -> None:
     expected = fp8_e4m3_per_token_qdq(x)
     actual = fp8_e4m3_per_token_qdq_fused(x)
 
-    assert torch.equal(actual, expected)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -182,7 +182,7 @@ def test_fused_swiglu_qdq_matches_reference(dtype: torch.dtype, shape):
     actual = torch.empty_like(expected)
     silu_mul_fp8_e4m3_per_token_qdq_fused(x, actual)
 
-    assert torch.equal(actual, expected)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -192,6 +192,59 @@ def test_fused_qdq_preserves_negative_zero(dtype):
     actual = fp8_e4m3_per_token_qdq_fused(x)
     expected = fp8_e4m3_per_token_qdq(x)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_qdq_tiny_activations_match_native_scale_floor(dtype):
+    """Rows below the native scale floor must not use a near-zero scale."""
+    _require_sm80()
+    torch.manual_seed(720)
+    x = torch.randn((17, 512), device="cuda")
+    x *= torch.logspace(-8, -1, 17, device="cuda").unsqueeze(1)
+    x = x.to(dtype)
+    x[0].zero_()
+    x[:, 0] = -0.0
+    actual = fp8_e4m3_per_token_qdq_fused(x)
+    expected = fp8_e4m3_per_token_qdq(x)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_swiglu_lookup_matches_native_for_finite_gates_and_signed_zero(dtype):
+    """Exercise every finite gate code with regular and signed-zero up values."""
+    _require_sm80()
+    gates = torch.arange(65536, device="cuda", dtype=torch.int32)
+    gates = gates.to(torch.int16).view(dtype)
+    gates = gates[torch.isfinite(gates)].reshape(-1, 256)
+    up_values = (0.5, 0.0, -0.0) * 4
+    gate = gates.repeat(len(up_values), 1)
+    up = torch.cat([torch.full_like(gates, v) for v in up_values])
+    x = torch.cat([gate, up], dim=1)
+    # Exercise the lookup path for both BF16 and FP16 dispatch thresholds.
+    assert x.shape[0] >= 2048
+    activation = torch.empty_like(gate)
+    torch.ops._C.silu_and_mul(activation, x)
+    expected = fp8_e4m3_per_token_qdq(activation)
+    actual = torch.empty_like(gate)
+    silu_mul_fp8_e4m3_per_token_qdq_fused(x, actual)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("rows", [1, 128, 2048])
+def test_fused_norm_qdq_matches_native_and_preserves_residual(rows):
+    """Fusion must quantize its BF16 norm output without mutating residual."""
+    _require_sm80()
+    from vllm.model_executor.layers.gemma_norm_fp8_qdq import norm_qdq_deferred_op
+
+    torch.manual_seed(721)
+    x = torch.randn((rows, 2048), device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    saved = residual.clone()
+    weight = torch.randn(2048, device="cuda", dtype=torch.bfloat16) * 0.03
+    norm, actual = norm_qdq_deferred_op(x, residual, weight, 1e-6)
+    expected = fp8_e4m3_per_token_qdq(norm)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(residual.view(torch.int16), saved.view(torch.int16))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

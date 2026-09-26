@@ -69,12 +69,19 @@ def _e4m3fn_qdq_software(values):
 
 
 @triton.jit
+def _fp8_e4m3_dynamic_scale(absmax):
+    # Match dynamic_per_token_scaled_fp8_quant, including tiny activations.
+    # Multiplying by a rounded reciprocal changes FP8 rounding boundaries.
+    return tl.maximum(tl.div_rn(absmax, 448.0), 1.0 / (448.0 * 512.0))
+
+
+@triton.jit
 def _fp8_e4m3_qdq_row(
     X, Y, row, input_stride, output_stride, C: tl.constexpr, BC: tl.constexpr
 ):
     c = tl.arange(0, BC)
     v = tl.load(X + row.to(tl.int64) * input_stride + c, c < C, 0).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(v), 0) * (1.0 / 448.0), 1.1754943508222875e-38)
+    scale = _fp8_e4m3_dynamic_scale(tl.max(tl.abs(v), 0))
     normalized = tl.clamp(tl.div_rn(v, scale), -448.0, 448.0)
     y = _e4m3fn_qdq_software(normalized) * scale
     tl.store(Y + row.to(tl.int64) * output_stride + c, y, c < C)
@@ -232,6 +239,16 @@ def _silu_mul_fp8_e4m3_per_token_qdq_kernel(
 
     gate = tl.load(input_row + offsets, mask=mask, other=0.0)
     up = tl.load(input_row + n_cols + offsets, mask=mask, other=0.0).to(tl.float32)
+    # The packed CUDA SwiGLU adds beta=+0 before multiplication. Preserve its
+    # signed-zero behavior rather than allowing this addition to be folded away.
+    up = tl.inline_asm_elementwise(
+        "add.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[up, 0.0],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
     if use_lookup:
         code = gate.to(tl.uint16, bitcast=True).to(tl.int32)
         silu = tl.load(silu_table + code).to(tl.float32)
@@ -242,7 +259,7 @@ def _silu_mul_fp8_e4m3_per_token_qdq_kernel(
         silu = silu.to(input_ptr.dtype.element_ty).to(tl.float32)
     activated = (silu * up).to(input_ptr.dtype.element_ty).to(tl.float32)
     absmax = tl.max(tl.abs(activated), axis=0)
-    scale = tl.maximum(absmax * (1.0 / 448.0), 1.1754943508222875e-38)
+    scale = _fp8_e4m3_dynamic_scale(absmax)
     normalized = tl.clamp(tl.div_rn(activated, scale), -448.0, 448.0)
     dequantized = _e4m3fn_qdq_software(normalized) * scale
 
@@ -341,9 +358,15 @@ def silu_mul_fp8_e4m3_per_token_qdq_fused(
     block_size, num_warps = _launch_config(n_cols, rows, swiglu=True)
     if rows == 0:
         return output
-    table = _get_silu_table(input) if n_cols == 256 and rows >= 512 else None
+    lookup_min_rows = 2048 if input.dtype == torch.bfloat16 else 512
+    table = (
+        _get_silu_table(input) if n_cols == 256 and rows >= lookup_min_rows else None
+    )
     if table is not None:
-        num_warps = 2 if rows >= 8192 else (8 if rows <= 512 else 4)
+        if input.dtype == torch.bfloat16:
+            num_warps = 1
+        else:
+            num_warps = 2 if rows >= 8192 else (8 if rows <= 512 else 4)
     _silu_mul_fp8_e4m3_per_token_qdq_kernel[(rows,)](
         input,
         output,

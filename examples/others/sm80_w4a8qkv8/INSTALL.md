@@ -1,5 +1,11 @@
 # v0.29.0-sm80w4a8qkv8 安装说明
 
+当前分支已合入 native-QDQ 精度修复及 BF16 SwiGLU 调度优化。
+下文原始发布 wheel 不包含这次源码更新；已有安装不会自动获得修复。
+请从当前分支构建新包，并使用独立版本号，例如
+`VLLM_VERSION_OVERRIDE=0.29.0+sm80w4a8qkv8.nativeqdq.cu132`，
+避免与原始 wheel 混淆。后端参数、自动选择和 OMP 环境继承方式保持不变。
+
 发布 wheel：`vllm-0.29.0+sm80w4a8qkv8.cu132-cp312-cp312-linux_x86_64.whl`。
 
 验证环境为 Linux x86_64、CPython 3.12.14、PyTorch 2.13.0+cu132、
@@ -78,7 +84,7 @@ CUDA_VISIBLE_DEVICES=0,1 PROFILE=w4a16 bash serve.sh /path/to/calibrated_model
 在匹配的 CUDA/PyTorch 构建环境中，进入该分支的仓库根目录：
 
 ```bash
-VLLM_VERSION_OVERRIDE=0.29.0+sm80w4a8qkv8.cu132 \
+VLLM_VERSION_OVERRIDE=0.29.0+sm80w4a8qkv8.nativeqdq.cu132 \
   bash examples/others/sm80_w4a8qkv8/build-wheel.sh
 ```
 
