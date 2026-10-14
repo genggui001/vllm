@@ -207,6 +207,24 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 "Using SM80 fused Gemma residual RMSNorm and expert FP8 QDQ"
             )
 
+        self._sm80_group32_norm_qdq = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(80)
+            and is_moe_layer
+            and config.hidden_size == 2048
+            and model_config.dtype == torch.bfloat16
+            and quant_config is not None
+            and quant_config.get_name() == "sm80_group32"
+            and not getattr(self.mlp.experts, "_fse_fuse_gate", False)
+            and not parallel_config.use_sequence_parallel_moe
+            and not parallel_config.enable_expert_parallel
+            and vllm_config.lora_config is None
+        )
+        if self._sm80_group32_norm_qdq:
+            self.mlp.experts._sm80_input_prepared = True
+            self.mlp.experts.routed_experts._sm80_group32_prepared = True
+            logger.info_once("Using SM80 residual RMSNorm and group32 expert QDQ")
+
         self.layer_scale = getattr(config, "layer_scale", False)
         if self.layer_scale:
             self.attn_layer_scale = torch.nn.Parameter(

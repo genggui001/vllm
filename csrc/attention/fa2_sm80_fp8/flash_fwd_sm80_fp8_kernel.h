@@ -209,7 +209,8 @@ __forceinline__ __device__ void decode_shared_fp8(const uint8_t* raw,
 }
 
 template <typename KernelTraits, bool IsDecode = false, bool UseAsync = false,
-          bool CompactAsync = false, bool PrequantizedQ = false>
+          bool CompactAsync = false, bool PrequantizedQ = false,
+          bool Split = false>
 inline __device__ void compute_attn_sm80_fp8(
     const Flash_fwd_sm80_fp8_params& params) {
   using Element = typename KernelTraits::Element;
@@ -232,7 +233,8 @@ inline __device__ void compute_attn_sm80_fp8(
   const int tidx = threadIdx.x;
   const int mma_thread = IsDecode ? tidx % 32 : tidx;
   const int output_partition = IsDecode ? tidx / 32 : 0;
-  const int m_block = blockIdx.x;
+  static_assert(!Split || (IsDecode && !CompactAsync));
+  const int m_block = Split ? 0 : blockIdx.x;
   const int bidb = blockIdx.y;
   const int bidh = blockIdx.z;
   const BlockInfo<true> binfo(params, bidb);
@@ -240,8 +242,16 @@ inline __device__ void compute_attn_sm80_fp8(
     return;
   }
 
-  const int n_block_min = 0;
+  int n_block_min = 0;
   int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+  index_t partial_row = 0;
+  if constexpr (Split) {
+    const int blocks_per_split = cute::ceil_div(n_block_max, params.num_splits);
+    n_block_min = blockIdx.x * blocks_per_split;
+    n_block_max = min(n_block_max, (int(blockIdx.x) + 1) * blocks_per_split);
+    partial_row = ((index_t(blockIdx.x) * params.b + bidb) * params.h + bidh) *
+                  params.seqlen_q;
+  }
   if (params.is_causal) {
     n_block_max = min(n_block_max, cute::ceil_div((m_block + 1) * kBlockM +
                                                       binfo.actual_seqlen_k -
@@ -250,6 +260,16 @@ inline __device__ void compute_attn_sm80_fp8(
   }
 
   if (n_block_max <= n_block_min) {
+    if constexpr (Split) {
+      auto* partial = reinterpret_cast<float*>(params.oaccum_ptr);
+      auto* lse = reinterpret_cast<float*>(params.softmax_lseaccum_ptr);
+      for (int i = tidx; i < binfo.actual_seqlen_q * kHeadDim;
+           i += KernelTraits::kNThreads) {
+        partial[partial_row * kHeadDim + i] = 0.0f;
+      }
+      if (tidx < binfo.actual_seqlen_q) lse[partial_row + tidx] = -INFINITY;
+      return;
+    }
     const int valid_rows =
         min(kBlockM, binfo.actual_seqlen_q - m_block * kBlockM);
     Element* out = reinterpret_cast<Element*>(params.o_ptr);
@@ -451,8 +471,35 @@ inline __device__ void compute_attn_sm80_fp8(
     __syncthreads();
   }
 
-  Tensor lse = softmax.template normalize_softmax_lse<false, false>(
+  Tensor lse = softmax.template normalize_softmax_lse<false, Split>(
       acc_o, params.scale_softmax);
+  if constexpr (Split) {
+    // Keep FP32 partials until the native split-KV combiner rounds to BF16.
+    Tensor coordinates =
+        make_identity_tensor(Shape<Int<kBlockM>, Int<kOutputDim>>{});
+    Tensor owned = thr_mma.partition_C(coordinates);
+    auto* partial = reinterpret_cast<float*>(params.oaccum_ptr);
+#pragma unroll
+    for (int i = 0; i < size(acc_o); ++i) {
+      const int row = get<0>(owned(i));
+      const int col = get<1>(owned(i)) + output_partition * kOutputDim;
+      if (row < binfo.actual_seqlen_q) {
+        partial[(partial_row + row) * kHeadDim + col] = acc_o(i);
+      }
+    }
+    Tensor rows = logical_divide(owned, Shape<_2>{})(make_coord(0, _), _, 0);
+    if (output_partition == 0 && get<1>(rows(0)) == 0) {
+#pragma unroll
+      for (int i = 0; i < size(lse); ++i) {
+        const int row = get<0>(rows(i));
+        if (row < binfo.actual_seqlen_q) {
+          reinterpret_cast<float*>(
+              params.softmax_lseaccum_ptr)[partial_row + row] = lse(i);
+        }
+      }
+    }
+    return;
+  }
   Tensor sO = make_tensor(make_smem_ptr(reinterpret_cast<Element*>(smem_raw)),
                           typename KernelTraits::SmemLayoutO{});
   Tensor sOPart = local_tile(sO, Shape<Int<kBlockM>, Int<kOutputDim>>{},

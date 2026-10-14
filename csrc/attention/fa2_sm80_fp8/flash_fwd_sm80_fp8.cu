@@ -337,3 +337,49 @@ void run_mha_fwd_sm80_fp8_staged(const Flash_fwd_sm80_fp8_params& source,
 }
 
 }  // namespace FLASH_NAMESPACE
+
+namespace FLASH_NAMESPACE {
+template <bool UseAsync>
+__global__ void group32_fp8_split(const Flash_fwd_sm80_fp8_params params) {
+  compute_attn_sm80_fp8<Sm80Fp8DecodeTraits, true, UseAsync, false, false,
+                        true>(params);
+}
+template <int LogSplits>
+__global__ void group32_combine(const Flash_fwd_sm80_fp8_params params) {
+  combine_attn_seqk_parallel<Sm80Fp8DecodeTraits, 4, LogSplits, true>(params);
+}
+void run_mha_fwd_sm80_fp8_split(Flash_fwd_sm80_fp8_params& params,
+                                cudaStream_t stream) {
+  constexpr size_t bytes =
+      Sm80Fp8DecodeTraits::kSmemSize + 2 * 256 * sizeof(cutlass::bfloat16_t);
+  const uint64_t alignment = reinterpret_cast<uintptr_t>(params.k_ptr) |
+                             reinterpret_cast<uintptr_t>(params.v_ptr) |
+                             params.k_batch_stride | params.k_row_stride |
+                             params.k_head_stride | params.v_batch_stride |
+                             params.v_row_stride | params.v_head_stride;
+  BOOL_SWITCH((alignment & 15U) == 0, UseAsync, [&] {
+    auto kernel = &group32_fp8_split<UseAsync>;
+    FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    kernel<<<dim3(params.num_splits, params.b, params.h), 128, bytes, stream>>>(
+        params);
+    FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+  });
+  const dim3 grid((params.b * params.h * params.seqlen_q + 3) / 4);
+  if (params.num_splits <= 2)
+    group32_combine<1><<<grid, 128, 0, stream>>>(params);
+  else if (params.num_splits <= 4)
+    group32_combine<2><<<grid, 128, 0, stream>>>(params);
+  else if (params.num_splits <= 8)
+    group32_combine<3><<<grid, 128, 0, stream>>>(params);
+  else if (params.num_splits <= 16)
+    group32_combine<4><<<grid, 128, 0, stream>>>(params);
+  else if (params.num_splits <= 32)
+    group32_combine<5><<<grid, 128, 0, stream>>>(params);
+  else if (params.num_splits <= 64)
+    group32_combine<6><<<grid, 128, 0, stream>>>(params);
+  else if (params.num_splits <= 128)
+    group32_combine<7><<<grid, 128, 0, stream>>>(params);
+  FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+}
+}  // namespace FLASH_NAMESPACE

@@ -87,9 +87,9 @@ def eager_break_during_capture(fn: F) -> F:
         def unified_attention_with_output(...):
             ...
     """
-    if not is_breakable_cudagraph_enabled():
-        return fn
 
+    # Attention ops can be imported before VllmConfig auto-enables graphs.
+    # Keep the boundary available and decide whether to break at call time.
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         capture = BreakableCUDAGraphCapture.current()

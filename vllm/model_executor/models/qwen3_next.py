@@ -371,6 +371,22 @@ class Qwen3NextAttention(nn.Module):
 
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.use_group32_qdq_reference = (
+            quant_config is not None
+            and quant_config.get_name() in ("sm80_qdq_reference", "sm80_group32")
+        )
+        self.use_group32_qkv_qdq = (
+            quant_config is not None and quant_config.get_name() == "sm80_group32"
+        )
+        self.use_group32_fp8_attention = (
+            self.use_group32_qkv_qdq
+            and self.attn.impl.__class__.__name__ == "FlashAttentionQkvFp8Sm80FusedImpl"
+        )
+
+        if self.use_group32_fp8_attention:
+            self.attn._sm80_group32_decode = True
+            self.attn.impl.prepare_group32_decode()
+            self.attn.impl.prepare_group32_prefill()
 
         # Fuse the gated split + QK-RMSNorm + (partial) NeoX RoPE + gate copy.
         mm_config = model_config.multimodal_config if model_config else None
@@ -388,7 +404,8 @@ class Qwen3NextAttention(nn.Module):
             torch.bfloat16,
         )
         self.use_fused_qk_norm_rope_gate = (
-            self.attn_output_gate
+            not self.use_group32_qdq_reference
+            and self.attn_output_gate
             and getattr(self.rotary_emb, "is_neox_style", False)
             and current_platform.is_cuda()
             and supports_dtype
@@ -397,7 +414,8 @@ class Qwen3NextAttention(nn.Module):
 
         # Prefer the calibrated SM80 fusion for its supported layout.
         self.use_qknorm_mrope_qdq = (
-            current_platform.is_cuda()
+            not self.use_group32_qdq_reference
+            and current_platform.is_cuda()
             and current_platform.is_device_capability(80)
             and self.attn_output_gate
             and self.rotary_emb.__class__.__name__ == "MRotaryEmbedding"
@@ -416,6 +434,30 @@ class Qwen3NextAttention(nn.Module):
             self.attn._qrope_prequantized_q = True
             logger.info_once("Using SM80 fused QK norm, MRoPE and query FP8 QDQ")
 
+        self.use_group32_qknorm_rope = (
+            self.use_group32_fp8_attention
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(80)
+            and self.attn_output_gate
+            and type(self.rotary_emb) is MRotaryEmbedding
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == 64
+            and tuple(self.rotary_emb.mrope_section or ()) == (11, 11, 10)
+            and self.rotary_emb.mrope_interleaved
+            and self.head_dim == 256
+            and self.num_heads == 8
+            and self.num_kv_heads == 4
+            and getattr(model_config, "dtype", None) == torch.bfloat16
+            and not self.rotary_emb.apply_rotary_emb.enable_fp32_compute
+            and getattr(self.rotary_emb._forward_method, "__name__", "")
+            in ("forward_cuda", "forward_native")
+        )
+        self._group32_cuda_rope = (
+            getattr(self.rotary_emb._forward_method, "__name__", "") == "forward_cuda"
+        )
+        if self.use_group32_qknorm_rope:
+            logger.info_once("Using SM80 group32 fused native-order QK norm and MRoPE")
+
     def _project_qkv_gate(
         self,
         qkv: torch.Tensor,
@@ -427,6 +469,20 @@ class Qwen3NextAttention(nn.Module):
         split + QK-RMSNorm + RoPE path. ``gate`` is ``None`` when output
         gating is disabled.
         """
+        if getattr(self, "use_group32_qknorm_rope", False):
+            from vllm.model_executor.layers.quantization.utils.sm80_group32_qknorm_rope import (  # noqa: E501
+                qknorm_mrope_native_order,
+            )
+
+            return qknorm_mrope_native_order(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                positions,
+                self.rotary_emb._match_cos_sin_cache_dtype(qkv),
+                eps=self.q_norm.variance_epsilon,
+                cuda_rope=self._group32_cuda_rope,
+            )
         if self.use_qknorm_mrope_qdq:
             return qknorm_mrope_qdq(
                 qkv,
@@ -499,6 +555,24 @@ class Qwen3NextAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        # The FP8 backend quantizes Q in FA2 and K/V in the cache writer.
+        if self.use_group32_qdq_reference and not self.use_group32_fp8_attention:
+            if self.use_group32_qkv_qdq:
+                from vllm.model_executor.layers.quantization.utils import (
+                    sm80_group32_qkv,
+                )
+
+                q, k, v = sm80_group32_qkv.qkv_fp8_qdq_fused(
+                    q, k, v, self.attn._q_scale, self.attn._k_scale, self.attn._v_scale
+                )
+            else:
+                from vllm.model_executor.layers.quantization.sm80_qdq_reference import (
+                    tensor_fp8_qdq,
+                )
+
+                q = tensor_fp8_qdq(q, self.attn._q_scale)
+                k = tensor_fp8_qdq(k, self.attn._k_scale)
+                v = tensor_fp8_qdq(v, self.attn._v_scale)
         attn_output = self.attn(q, k, v)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
@@ -640,7 +714,19 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
 
         # Fully Connected
-        if getattr(self, "_sm80_norm_qdq", False):
+        if getattr(self, "_sm80_group32_norm_qdq", False):
+            from vllm.model_executor.layers.quantization.utils import sm80_group32_norm
+
+            hidden_states, prepared, residual = (
+                sm80_group32_norm.residual_norm_group32_qdq(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+            )
+            hidden_states = self.mlp(hidden_states, prepared_hidden_states=prepared)
+        elif getattr(self, "_sm80_norm_qdq", False):
             normalized, prepared = norm_qdq_deferred_op(
                 hidden_states,
                 residual,

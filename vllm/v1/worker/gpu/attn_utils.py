@@ -328,7 +328,9 @@ def build_attn_metadata(
                     else {}
                 )
                 metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
+                    common_prefix_len=attn_metadata_extra_kwargs.pop(
+                        "common_prefix_len", 0
+                    ),
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )

@@ -704,6 +704,11 @@ class VllmConfig:
         if model_config is None:
             return False
 
+        if getattr(model_config, "quantization", None) == "sm80_group32":
+            from vllm.platforms import current_platform
+
+            if current_platform.is_cuda() and current_platform.is_device_capability(80):
+                return True
         architectures = set(model_config.architectures)
         return bool(architectures & default_breakable_cudagraph_architectures())
 

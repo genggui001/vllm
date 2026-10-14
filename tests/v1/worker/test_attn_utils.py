@@ -318,3 +318,45 @@ def test_copy_kv_cache_blocks_with_virtual_block_splitting(
             torch.testing.assert_close(
                 cache[dst_start + physical_idx], expected[layer_idx][physical_idx]
             )
+
+
+@pytest.mark.parametrize("prefix", [None, 32])
+@pytest.mark.parametrize("capture", [False, True])
+def test_model_specific_cascade_prefix_reaches_only_normal_builder(prefix, capture):
+    """Default builders retain zero prefix; capture bypasses runtime metadata."""
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+    from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+
+    class Builder:
+        def build(self, common_prefix_len, common_attn_metadata):
+            return common_prefix_len
+
+        def build_for_cudagraph_capture(self, common_attn_metadata):
+            return -1
+
+    class Metadata(ModelSpecificAttnMetadata):
+        def get_extra_attn_kwargs(self, attn_metadata_builder, num_reqs):
+            return {} if prefix is None else {"common_prefix_len": prefix}
+
+    builder = Builder()
+    group = SimpleNamespace(
+        get_metadata_builder=lambda _: builder, layer_names=["layer"]
+    )
+    result = build_attn_metadata(
+        attn_groups=[[group]],
+        num_reqs=2,
+        num_tokens=2,
+        query_start_loc_gpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
+        max_query_len=1,
+        seq_lens=torch.tensor([40, 41], dtype=torch.int32),
+        max_seq_len=41,
+        block_tables=[torch.zeros((2, 4), dtype=torch.int32)],
+        slot_mappings=torch.zeros((1, 2), dtype=torch.int64),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[None]),
+        model_specific_attn_metadata=Metadata(),
+        for_cudagraph_capture=capture,
+    )
+    assert result == {"layer": -1 if capture else (prefix or 0)}

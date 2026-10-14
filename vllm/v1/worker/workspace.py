@@ -140,7 +140,24 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
+    def reserve_for_all_ubatches(self, required_bytes: int) -> None:
+        """Reserve this lane's slots during initialization, before KV profiling.
+
+        Call only before execution or graph capture can retain workspace views.
+        Other lanes retain their independently configured capacities.
+        """
+        if required_bytes < 0:
+            raise ValueError("Workspace reservation must be non-negative.")
+        if self._locked:
+            raise RuntimeError("Cannot reserve workspace after locking.")
+        if required_bytes == 0:
+            return
+        for ubatch_id in range(self._num_ubatches):
+            self._ensure_workspace_size(required_bytes, ubatch_id=ubatch_id)
+
+    def _ensure_workspace_size(
+        self, required_bytes: int, *, ubatch_id: int | None = None
+    ) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
         Args:
@@ -149,7 +166,8 @@ class WorkspaceManager:
         Returns:
             The current workspace tensor.
         """
-        ubatch_id = dbo_current_ubatch_id()
+        if ubatch_id is None:
+            ubatch_id = dbo_current_ubatch_id()
         lane = _workspace_lane.get()
         if lane >= self._num_lanes:
             raise RuntimeError(

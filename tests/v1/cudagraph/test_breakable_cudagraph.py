@@ -18,8 +18,7 @@ import torch
 def _enable_breakable_cudagraph(monkeypatch: pytest.MonkeyPatch):
     """Enable breakable cudagraphs for this module's tests only.
 
-    eager_break_during_capture reads the env at decoration time, which
-    happens inside the test bodies, so a per-test fixture suffices.
+    Configure capture per test rather than setting process-wide policy at import.
     monkeypatch restores the env so other test files running in the same
     pytest process are unaffected (a module-level os.environ assignment
     used to leak into test_cudagraph_dispatch.py and break it).
@@ -288,7 +287,10 @@ def test_capture_replay_matches_eager_simple(cuda_capture_stream):
     assert log == ["eager", "eager", "eager"]
 
 
-def test_decorator_breaks_when_invoked_inside_capture(cuda_capture_stream):
+@pytest.mark.parametrize("enable_after_decoration", [False, True])
+def test_decorator_breaks_when_invoked_inside_capture(
+    cuda_capture_stream, monkeypatch: pytest.MonkeyPatch, enable_after_decoration: bool
+):
     """Verify @eager_break_during_capture correctly routes through
     add_eager when inside a capture context, and runs straight through
     when there's no active capture."""
@@ -297,10 +299,16 @@ def test_decorator_breaks_when_invoked_inside_capture(cuda_capture_stream):
         eager_break_during_capture,
     )
 
+    if enable_after_decoration:
+        # ModelConfig may import attention before VllmConfig enables the graphs.
+        monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+
     @eager_break_during_capture
     def attention_like(t: torch.Tensor) -> None:
         # In-place double; stands in for "real" attention work.
         t.mul_(2.0)
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
 
     x = torch.zeros(4, device="cuda")
 
@@ -485,3 +493,118 @@ def test_nested_decorated_op_runs_inline(cuda_capture_stream):
     # 0 -> +2 -> +1 (inner) -> +10 (outer) -> +100 = 113
     assert torch.equal(x, torch.full((4,), 113.0, device="cuda"))
     assert inner_calls == 2  # replay invokes the outer's lambda again
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_gdn_break_replay_uses_current_metadata(packed):
+    """GDN replay must read fresh metadata and write the same output buffer.
+
+    Use a fresh process because decorators inspect the opt-in env at import.
+    The CPU dispatch test catches a missing boundary without loading a model.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    code = textwrap.dedent("""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import torch
+        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+        from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+
+        ctx = SimpleNamespace(attn_metadata=1, no_compile_layers={})
+        output = torch.zeros(2)
+        calls = []
+        def core(**kwargs):
+            kwargs['core_attn_out'].fill_(ctx.attn_metadata)
+        ctx.no_compile_layers['layer'] = SimpleNamespace(
+            _forward_core=core, _forward_core_fused_norm_packed=core)
+        def add_eager(fn):
+            calls.append(fn)
+            return fn()
+        capture = SimpleNamespace(_capturing=True, add_eager=add_eager)
+        with (
+            patch.object(BreakableCUDAGraphCapture, 'current', return_value=capture),
+            patch.object(gdn, 'get_forward_context', return_value=ctx),
+            patch('vllm.compilation.breakable_cudagraph.weak_ref_tensor',
+                  side_effect=lambda value: value),
+        ):
+            if PACKED:
+                gdn.qwen_gdn_attention_core_fused_norm_packed(
+                    output, output, output, 'layer')
+            else:
+                gdn.qwen_gdn_attention_core(output, output, output, output, 'layer')
+            assert len(calls) == 1
+            ctx.attn_metadata = 7
+            calls[0]()
+            assert torch.equal(output, torch.full_like(output, 7))
+    """).replace("PACKED", repr(packed))
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@pytest.mark.parametrize("env_value", [None, "0", "1"])
+@pytest.mark.parametrize("backend_name", ["eager", "aot_eager"])
+def test_decorated_custom_op_preserves_fullgraph_compile(
+    monkeypatch: pytest.MonkeyPatch, env_value: str | None, backend_name: str
+):
+    """Normal compiled custom ops must read fresh metadata without graph breaks."""
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    if env_value is None:
+        monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", env_value)
+
+    metadata = {"scale": 2}
+    calls = []
+
+    @eager_break_during_capture
+    def kernel(x: torch.Tensor, out: torch.Tensor) -> None:
+        calls.append(metadata["scale"])
+        out.copy_(x * metadata["scale"])
+
+    def fake(x: torch.Tensor, out: torch.Tensor) -> None:
+        return
+
+    lib = torch.library.Library("breakable_compile_test", "FRAGMENT")
+    direct_register_custom_op(
+        op_name="with_output",
+        op_func=kernel,
+        mutates_args=["out"],
+        fake_impl=fake,
+        target_lib=lib,
+        dispatch_key="CPU",
+    )
+    op = torch.ops.breakable_compile_test.with_output.default
+
+    def model(x):
+        out = torch.empty_like(x)
+        op(x + 1, out)
+        return out - 3
+
+    graphs = []
+    backend = torch._dynamo.lookup_backend(backend_name)
+
+    def counting_backend(gm, inputs):
+        graphs.append(gm)
+        return backend(gm, inputs)
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(
+            model, backend=counting_backend, fullgraph=True, dynamic=True
+        )
+        for rows, scale in [(3, 2), (5, 3), (3, 4)]:
+            metadata["scale"] = scale
+            x = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+            expected = (x + 1) * scale - 3
+            actual = compiled(x)
+            assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+        assert calls == [2, 3, 4]
+        assert graphs
+        assert all(any(node.target == op for node in gm.graph.nodes) for gm in graphs)
+    finally:
+        torch._dynamo.reset()
+        lib._destroy()

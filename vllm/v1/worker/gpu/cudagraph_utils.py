@@ -294,6 +294,10 @@ class CudaGraphManager:
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
 
+        exact_piecewise = (
+            getattr(self.vllm_config.model_config, "quantization", None)
+            == "sm80_group32"
+        )
         for mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
             mode_descs = tuple(reversed(descs_by_mode.get(mode, [])))
             for num_active_loras in self.lora_capture_cases:
@@ -306,7 +310,10 @@ class CudaGraphManager:
                 for num_tokens, group in groupby(lora_descs, lambda d: d.num_tokens):
                     matching = list(group)
                     padding_limit = self.compilation_config.cudagraph_max_padding_size
-                    if padding_limit is not None and num_tokens > padding_limit:
+                    # Padding changes group32 GEMM/normalization rounding.
+                    if (mode == CUDAGraphMode.PIECEWISE and exact_piecewise) or (
+                        padding_limit is not None and num_tokens > padding_limit
+                    ):
                         current_range_start = num_tokens
                     for i in range(current_range_start, num_tokens + 1):
                         key = (i, num_active_loras)

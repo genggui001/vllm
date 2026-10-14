@@ -11,6 +11,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.short_conv_attn import (
@@ -18,7 +19,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     ShortConvAttentionMetadataBuilder,
 )
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -41,6 +42,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    common_prefix_lens: dict[int, int] | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -54,6 +56,13 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
         attn_metadata_builder: Any,
         num_reqs: int,
     ) -> dict[str, Any]:
+        if (
+            self.common_prefix_lens
+            and id(attn_metadata_builder) in self.common_prefix_lens
+        ):
+            return {
+                "common_prefix_len": self.common_prefix_lens[id(attn_metadata_builder)]
+            }
         if not isinstance(
             attn_metadata_builder,
             (
@@ -229,6 +238,67 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
         )
 
+    def _group32_cascade_prefixes(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        attn_groups: list[list[AttentionGroup]],
+        for_capture: bool,
+    ) -> dict[int, int] | None:
+        config = self.vllm_config
+        if (
+            self.model_config.quantization != "sm80_group32"
+            or self.model_config.disable_cascade_attn
+            or not self.cache_config.enable_prefix_caching
+            or for_capture
+            or cudagraph_mode != CUDAGraphMode.NONE
+            or config.parallel_config.prefill_context_parallel_size != 1
+            or config.parallel_config.decode_context_parallel_size != 1
+            or not input_batch.num_common_prefix_blocks
+            or input_batch.num_reqs == 0
+        ):
+            return None
+
+        from vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused import (
+            FlashAttentionQkvFp8Sm80FusedMetadataBuilder,
+        )
+
+        # CPU computed-token counts can include speculative positions. Restrict
+        # the unmasked cascade prefix to confirmed prefill history before them.
+        confirmed = int(
+            np.minimum(
+                input_batch.num_computed_tokens_np[: input_batch.num_reqs],
+                input_batch.num_computed_prefill_tokens_np[: input_batch.num_reqs],
+            ).min()
+        )
+        prefixes = {}
+        for group_id, groups in enumerate(attn_groups):
+            blocks = input_batch.num_common_prefix_blocks[group_id]
+            if blocks <= 0:
+                continue
+            for group in groups:
+                builder = group.get_metadata_builder(0)
+                spec = group.kv_cache_spec
+                if not isinstance(
+                    builder, FlashAttentionQkvFp8Sm80FusedMetadataBuilder
+                ) or not isinstance(spec, FullAttentionSpec):
+                    continue
+                prefix = min(blocks * spec.block_size, confirmed)
+                prefix = prefix // spec.block_size * spec.block_size
+                if prefix > 0 and builder.use_cascade_attention(
+                    common_prefix_len=prefix,
+                    query_lens=input_batch.num_scheduled_tokens,
+                    num_query_heads=builder.num_heads_q,
+                    num_kv_heads=spec.num_kv_heads,
+                    use_alibi=self.model_config.uses_alibi,
+                    use_sliding_window=spec.sliding_window is not None,
+                    use_local_attention=spec.attention_chunk_size is not None,
+                    num_sms=num_compute_units(self.device.index or 0),
+                    dcp_world_size=builder.dcp_world_size,
+                ):
+                    prefixes[id(builder)] = prefix
+        return prefixes or None
+
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -307,6 +377,9 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            common_prefix_lens=self._group32_cascade_prefixes(
+                input_batch, cudagraph_mode, attn_groups, for_capture
+            ),
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

@@ -112,6 +112,9 @@ class InputBatch:
     # stays valid for every replay the graph serves.
     max_query_len: int | None = None
 
+    # Scheduler-confirmed shared physical blocks, indexed by KV cache group.
+    num_common_prefix_blocks: list[int] | None = None
+
     @classmethod
     def make_dummy(
         cls,

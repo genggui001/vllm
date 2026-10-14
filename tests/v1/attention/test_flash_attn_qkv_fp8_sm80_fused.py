@@ -3,6 +3,7 @@
 
 import importlib
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -63,6 +64,184 @@ def test_backend_registration_spec_and_guards() -> None:
     assert not builder.use_cascade_attention(common_prefix_len=128, **cascade_args)
 
 
+@pytest.mark.parametrize(
+    "tokens,context,sequences,expected_budget",
+    [(16, 64, 2, 0), (32, 64, 2, 656640), (128, 1024, 4, 4 * 1024**2)],
+)
+def test_group32_prefill_reserves_shared_capacity_before_kv_sizing(
+    monkeypatch, tokens, context, sequences, expected_budget
+):
+    """Ten attention layers must share one reservation per execution slot."""
+    import vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused as backend
+    import vllm.v1.worker.workspace as workspace
+
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=context),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=tokens, max_num_seqs=sequences
+        ),
+    )
+    monkeypatch.setattr(backend, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(backend, "is_workspace_manager_initialized", lambda: True)
+    monkeypatch.setattr(backend, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(backend, "_GROUP32_PREFILL_WORKSPACE_LIMIT", 4 * 1024**2)
+    pointers = None
+    for _ in range(10):
+        impl = object.__new__(backend.FlashAttentionQkvFp8Sm80FusedImpl)
+        impl.num_heads, impl.num_kv_heads, impl.head_size = 8, 4, 256
+        impl._group32_prefill_budget = 0
+        impl.prepare_group32_prefill()
+        assert impl._group32_prefill_budget == expected_budget
+        current = tuple(
+            None if ws is None else (ws.data_ptr(), ws.numel())
+            for ws in manager._current_workspaces
+        )
+        if pointers is not None:
+            assert current == pointers
+        pointers = current
+    assert manager._current_workspaces[1::2] == [None, None]
+    allocated = sum(ws.numel() for ws in manager._current_workspaces if ws is not None)
+    assert allocated == 2 * expected_budget
+
+
+@pytest.mark.parametrize(
+    "total,batch,max_query,max_kv,budget,expected",
+    [
+        (128, 1, 128, 128, 1536 * 1024**2, False),
+        (511, 1, 511, 511, 1536 * 1024**2, False),
+        (513, 1, 513, 513, 1536 * 1024**2, False),
+        (8192, 1, 8192, 49152, 1536 * 1024**2, False),
+        (8192, 1, 8192, 57344, 1536 * 1024**2, True),
+        (8192, 4, 8192, 32768, 1536 * 1024**2, True),
+        (8192, 1, 8192, 262080, 1536 * 1024**2, True),
+        (8192, 16, 8192, 262080, 1536 * 1024**2, False),
+        (64, 1, 16, 131072, 1536 * 1024**2, False),
+        (64, 1, 17, 131072, 1536 * 1024**2, True),
+        (8192, 1, 8192, 57344, 256 * 1024**2, False),
+        (8192, 1, 8192, 57344, 268711935, False),
+        (8192, 1, 8192, 57344, 268711936, True),
+    ],
+)
+def test_group32_prefill_expands_only_between_staging_limits(
+    total, batch, max_query, max_kv, budget, expected
+):
+    """Preserve the small path and direct fallback; cover exact capacity edges."""
+    from vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused import (
+        FlashAttentionQkvFp8Sm80FusedImpl,
+    )
+
+    impl = object.__new__(FlashAttentionQkvFp8Sm80FusedImpl)
+    impl.num_heads, impl.num_kv_heads, impl.head_size = 8, 4, 256
+    impl._group32_prefill_budget = budget
+    assert (
+        impl._needs_expanded_group32_prefill(total, batch, max_query, max_kv)
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "max_kv,group32,prequantized,expected",
+    [
+        (128, True, False, "original"),
+        (131072, True, False, "workspace"),
+        (524288, True, False, "original"),
+        (131072, False, False, "original"),
+        (131072, False, True, "prequantized"),
+        (131072, True, True, "prequantized"),
+    ],
+)
+def test_group32_prefill_dispatch_preserves_original_short_and_legacy_calls(
+    monkeypatch, max_kv, group32, prequantized, expected
+):
+    """Only eligible expanded prefill may request a workspace or its operator."""
+    import vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused as backend
+
+    impl = object.__new__(backend.FlashAttentionQkvFp8Sm80FusedImpl)
+    impl.num_heads, impl.num_kv_heads, impl.head_size = 8, 4, 256
+    impl.scale = 0.0625
+    impl._group32_prefill_budget = 1536 * 1024**2
+    calls = []
+    scratch = torch.empty(1, dtype=torch.uint8)
+
+    def get_workspace(*args):
+        calls.append("get_workspace")
+        return [scratch]
+
+    monkeypatch.setattr(
+        backend,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(get_simultaneous=get_workspace),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    ops = torch.ops._vllm_fa2_sm80_fp8_C
+    for name, label in [
+        ("varlen_fwd", "original"),
+        ("varlen_fwd_lse", "original_lse"),
+        ("varlen_fwd_prequantized_q", "prequantized"),
+        ("varlen_fwd_group32_prefill_workspace_lse", "workspace"),
+    ]:
+        monkeypatch.setattr(ops, name, lambda *args, label=label: calls.append(label))
+    query = torch.empty((128, 8, 256), dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    cache = torch.empty((1, 4, 16, 512), dtype=torch.uint8)
+    scale = torch.ones(1, dtype=torch.float32)
+    layer = SimpleNamespace(
+        _q_scale=scale,
+        _k_scale=scale,
+        _v_scale=scale,
+        _sm80_group32_decode=group32,
+        _qrope_prequantized_q=prequantized,
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=128,
+        use_cascade=False,
+        max_query_len=128,
+        max_seq_len=max_kv,
+        causal=True,
+        query_start_loc=torch.tensor([0, 128], dtype=torch.int32),
+        seq_lens=torch.tensor([max_kv], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    actual = impl.forward(layer, query, None, None, cache, metadata, output)
+    assert actual is output
+    assert calls == (
+        ["get_workspace", "workspace"] if expected == "workspace" else [expected]
+    )
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+def test_group32_prefill_runtime_reuses_workspace_and_preserves_lse(monkeypatch):
+    """The backend must use the reserved slot and preserve cascade intermediates."""
+    import vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused as backend
+    import vllm.v1.worker.workspace as workspace
+
+    manager = workspace.WorkspaceManager(torch.device("cuda"))
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(backend, "current_workspace_manager", lambda: manager)
+    impl = object.__new__(backend.FlashAttentionQkvFp8Sm80FusedImpl)
+    impl.num_heads, impl.num_kv_heads, impl.head_size = 8, 4, 256
+    impl._group32_prefill_budget = 8 * 1024**2
+    monkeypatch.setattr(backend, "_GROUP32_PREFILL_DEFAULT_BUDGET", 0)
+    manager.reserve_for_all_ubatches(impl._group32_prefill_budget)
+    manager.lock()
+    args = _small_op_inputs((64, 65), (257, 513))
+    output, lse = impl._forward_group32_prefill(*args)
+    saved_output, saved_lse = output.clone(), lse.clone()
+    other = _small_op_inputs((128,), (2049,))
+    impl._forward_group32_prefill(*other)
+    impl._forward_group32_prefill(*_small_op_inputs((1,), (17,)))
+    assert torch.equal(output.view(torch.int16), saved_output.view(torch.int16))
+    assert torch.equal(lse.view(torch.int32), saved_lse.view(torch.int32))
+    reference = list(args)
+    reference[3] = torch.empty_like(output)
+    expected, expected_lse = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(*reference)
+    assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(lse.view(torch.int32), expected_lse.view(torch.int32))
+
+
 def _qdq(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     return (
@@ -107,6 +286,10 @@ def test_cuda_op_matches_materialized_fa2_qdq(
     cache_padding: int,
     num_query_heads: int = 8,
     num_kv_heads: int = 4,
+    group32_decode: bool = False,
+    num_splits: int = 0,
+    max_length_bound: int | None = None,
+    stage_budget_bytes: int | None = None,
 ) -> None:
     importlib.import_module("vllm.vllm_flash_attn._vllm_fa2_C")
     importlib.import_module("vllm.vllm_flash_attn._vllm_fa2_sm80_fp8_C")
@@ -115,7 +298,8 @@ def test_cuda_op_matches_materialized_fa2_qdq(
     device = torch.device("cuda")
     head_size, page_size = 256, 16
     batch_size = len(query_lens)
-    pages_per_sequence = max(math.ceil(length / page_size) for length in kv_lens)
+    max_length = max(kv_lens) if max_length_bound is None else max_length_bound
+    pages_per_sequence = math.ceil(max_length / page_size)
     num_pages = batch_size * pages_per_sequence
     block_table = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
         batch_size, pages_per_sequence
@@ -184,10 +368,23 @@ def test_cuda_op_matches_materialized_fa2_qdq(
     reference = torch.empty_like(query)
     softmax_scale = head_size**-0.5
 
+    workspace = None
+    if stage_budget_bytes is not None:
+        workspace = torch.empty(stage_budget_bytes, dtype=torch.uint8, device=device)
     torch.accelerator.synchronize()
     torch.accelerator.reset_peak_memory_stats()
     allocated = torch.accelerator.memory_allocated()
-    _, output_lse = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(
+    ops = torch.ops._vllm_fa2_sm80_fp8_C
+    fwd = ops.varlen_fwd_group32_lse if group32_decode else ops.varlen_fwd_lse
+    extra: dict[str, int | torch.Tensor] = (
+        {"num_splits": num_splits} if group32_decode else {}
+    )
+    if stage_budget_bytes is not None:
+        assert not group32_decode
+        assert workspace is not None
+        fwd = ops.varlen_fwd_group32_prefill_workspace_lse
+        extra = {"stage_budget_bytes": stage_budget_bytes, "workspace": workspace}
+    _, output_lse = fwd(
         query,
         key_bytes,
         value_bytes,
@@ -199,13 +396,18 @@ def test_cuda_op_matches_materialized_fa2_qdq(
         k_scale,
         v_scale,
         max(query_lens),
-        max(kv_lens),
+        max_length,
         softmax_scale,
         causal,
+        **extra,
     )
     torch.accelerator.synchronize()
     temporary_bytes = torch.accelerator.max_memory_allocated() - allocated
-    assert temporary_bytes <= 256 * 1024 * 1024
+    workspace_limit = 256 * 1024 * 1024
+    if stage_budget_bytes is not None:
+        lse_bytes = sum(query_lens) * num_query_heads * 4
+        workspace_limit = lse_bytes + 512
+    assert temporary_bytes <= workspace_limit
     dummy_cu_k = torch.zeros_like(cu_query_lens)
     _, reference_lse, *_ = torch.ops._vllm_fa2_C.varlen_fwd(
         query_reference,
@@ -219,16 +421,16 @@ def test_cuda_op_matches_materialized_fa2_qdq(
         block_table,
         None,
         max(query_lens),
-        max(kv_lens),
+        max_length,
         0.0,
         softmax_scale,
         False,
         causal,
         -1,
-        0 if causal else -1,
+        -1 if group32_decode else (0 if causal else -1),
         0.0,
         False,
-        0,
+        num_splits,
         None,
     )
 
@@ -755,3 +957,213 @@ def test_sm80_auto_qkv_does_not_replace_other_gpu_backends(capability, monkeypat
         lambda *args, **kwargs: DeviceCapability(*capability),
     )
     assert not quant.uses_sm80_fp8_qkv()
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize(
+    ("batch", "length", "bound", "splits"),
+    [
+        (1, 129, 2048, 0),
+        (4, 513, 513, 0),
+        (43, 129, 2048, 0),
+        (44, 129, 2048, 0),
+        (65, 257, 257, 0),
+        (1, 129, 2048, 1),
+        (4, 129, 2048, 3),
+        (1, 17, 2048, 128),
+    ],
+)
+@pytest.mark.parametrize("cache_padding", [-1, 8])
+def test_group32_decode_matches_native_automatic_split_bits(
+    batch, length, bound, splits, cache_padding
+):
+    """Production no-window decode must keep native split and BF16 rounding."""
+    test_cuda_op_matches_materialized_fa2_qdq(
+        [1] * batch,
+        [length] * batch,
+        True,
+        cache_padding,
+        group32_decode=True,
+        num_splits=splits,
+        max_length_bound=bound,
+    )
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize("cache_padding", [-1, 8])
+@pytest.mark.parametrize(
+    ("query_lens", "kv_lens", "causal", "budget_mib"),
+    [
+        pytest.param([64], [257], True, 0, id="explicit-direct"),
+        pytest.param([8192], [49152], True, 256, id="original-budget-fit"),
+        pytest.param([8192], [57344], True, 256, id="original-budget-fallback"),
+        pytest.param([8192], [57344], True, 768, id="first-expanded-chunk"),
+        pytest.param([8192], [131072], True, 768, id="long-chunk"),
+        pytest.param([8192], [262080], True, 1536, id="near-model-limit"),
+        pytest.param([1, 8191], [32769, 8191], True, 768, id="mixed-batch2"),
+        pytest.param([1, 1, 8190], [32770, 32769, 8190], True, 768, id="mixed-batch3"),
+        pytest.param(
+            [1, 1, 1, 8189], [32771, 32770, 32769, 8189], True, 768, id="mixed-batch4"
+        ),
+        pytest.param([64, 64], [65537, 131071], False, 1536, id="noncausal-ragged"),
+    ],
+)
+def test_group32_prefill_budget_preserves_materialized_fa2_bits(
+    query_lens, kv_lens, causal, budget_mib, cache_padding
+):
+    test_cuda_op_matches_materialized_fa2_qdq(
+        query_lens,
+        kv_lens,
+        causal,
+        cache_padding,
+        stage_budget_bytes=budget_mib * 1024 * 1024,
+    )
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize(
+    "case",
+    ["small", "dtype", "rank", "stride", "alignment", "cpu", "device", "alias"],
+)
+def test_group32_prefill_rejects_invalid_workspace_before_launch(case):
+    """Reject unsafe scratch storage without damaging the CUDA context."""
+    args = _small_op_inputs((64,), (257,))
+    budget = 256
+    workspace = torch.empty(budget, dtype=torch.uint8, device="cuda")
+    if case == "small":
+        workspace = workspace[:-1]
+    elif case == "dtype":
+        workspace = workspace.float()
+    elif case == "rank":
+        workspace = workspace.reshape(16, 16)
+    elif case == "stride":
+        workspace = torch.empty(budget * 2, dtype=torch.uint8, device="cuda")[::2]
+    elif case == "alignment":
+        workspace = torch.empty(budget + 1, dtype=torch.uint8, device="cuda")[1:]
+    elif case == "cpu":
+        workspace = workspace.cpu()
+    elif case == "device":
+        if torch.accelerator.device_count() < 2:
+            pytest.skip("Two visible SM80 devices are required")
+        workspace = workspace.to("cuda:1")
+    elif case == "alias":
+        workspace = args[1].flatten()
+    with pytest.raises(RuntimeError):
+        torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_group32_prefill_workspace_lse(
+            *args, budget, workspace
+        )
+    torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_lse(*args)
+    torch.accelerator.synchronize()
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize("budget_delta", [0, -1])
+def test_group32_prefill_workspace_reuse_preserves_results_and_graph(budget_delta):
+    """Test the exact staging boundary, canaries, LSE ownership and graph replay."""
+    args = _small_op_inputs((64, 65), (257, 513))
+    q, k = args[:2]
+    pages = math.ceil(args[11] / 16)
+    budget = q.numel() * 2 + q.shape[0] * q.shape[1] * 4
+    budget += 2 * pages * (4 * 16 * k.shape[2] * 256 + 4)
+    budget += budget_delta
+    storage = torch.full((budget + 512,), 173, dtype=torch.uint8, device="cuda")
+    workspace = storage[256 : 256 + budget]
+    ops = torch.ops._vllm_fa2_sm80_fp8_C
+    op = ops.varlen_fwd_group32_prefill_workspace_lse
+    result, lse = op(*args, budget, workspace)
+    saved_result, saved_lse = result.clone(), lse.clone()
+    other = list(args)
+    other[0] = torch.randn_like(q)
+    other[3] = torch.empty_like(q)
+    op(*other, budget, workspace)
+    assert torch.equal(result.view(torch.int16), saved_result.view(torch.int16))
+    assert torch.equal(lse.view(torch.int32), saved_lse.view(torch.int32))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            op(*args, budget, workspace)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result, lse = op(*args, budget, workspace)
+    reference = list(args)
+    reference[3] = torch.empty_like(q)
+    reference_workspace = torch.empty_like(workspace)
+    for step in range(12):
+        args[0].normal_()
+        args[5].copy_(torch.tensor([257 - step, 513 - step], device="cuda"))
+        args[6].copy_(args[6].roll(1, dims=1))
+        expected, expected_lse = op(*reference, budget, reference_workspace)
+        graph.replay()
+        assert torch.equal(result.view(torch.int16), expected.view(torch.int16))
+        assert torch.equal(lse.view(torch.int32), expected_lse.view(torch.int32))
+        assert (storage[:256] == 173).all() and (storage[256 + budget :] == 173).all()
+
+
+@pytest.mark.parametrize(
+    "mode,eager,group32,max_query,max_kv,expected_bound,expected_op",
+    [
+        ("FULL", False, True, 1, 8193, 16384, "group32"),
+        ("FULL", False, True, 1, 16384, 16384, "group32"),
+        ("FULL", False, True, 1, 32768, 32768, "group32"),
+        ("FULL_DECODE_ONLY", False, True, 1, 8193, 16384, "group32"),
+        ("FULL_AND_PIECEWISE", False, True, 1, 8193, 16384, "group32"),
+        ("NONE", False, True, 1, 8193, 8193, "group32"),
+        ("PIECEWISE", False, True, 1, 8193, 8193, "group32"),
+        ("FULL", True, True, 1, 8193, 8193, "group32"),
+        ("FULL", False, False, 1, 8193, 8193, "original"),
+        ("FULL", False, True, 2, 8193, 8193, "original"),
+    ],
+)
+def test_group32_decode_keeps_capture_split_bound_in_eager_fallback(
+    monkeypatch, mode, eager, group32, max_query, max_kv, expected_bound, expected_op
+):
+    """FULL Graph fallback must keep KV reduction partitions; preserve other paths."""
+    import vllm.v1.attention.backends.flash_attn_qkv_fp8_sm80_fused as backend
+    from vllm.config.compilation import CUDAGraphMode
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=16384, enforce_eager=eager),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode[mode]),
+    )
+    monkeypatch.setattr(backend, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    impl = object.__new__(backend.FlashAttentionQkvFp8Sm80FusedImpl)
+    impl.num_heads, impl.num_kv_heads, impl.head_size = 16, 8, 256
+    impl.scale = 0.0625
+    impl._group32_prefill_budget = 0
+    impl._group32_decode_bound = 0
+    if group32:
+        impl.prepare_group32_decode()
+    calls = []
+    ops = torch.ops._vllm_fa2_sm80_fp8_C
+    for name, label in [("varlen_fwd", "original"), ("varlen_fwd_group32", "group32")]:
+        monkeypatch.setattr(ops, name, lambda *a, label=label: calls.append((label, a)))
+    query = torch.empty((max_query, 16, 256), dtype=torch.bfloat16)
+    output = torch.empty_like(query)
+    cache = torch.empty((1, 8, 16, 512), dtype=torch.uint8)
+    scale = torch.ones(1, dtype=torch.float32)
+    layer = SimpleNamespace(
+        _q_scale=scale, _k_scale=scale, _v_scale=scale, _sm80_group32_decode=group32
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=max_query,
+        use_cascade=False,
+        max_query_len=max_query,
+        max_seq_len=max_kv,
+        causal=True,
+        max_num_splits=0,
+        query_start_loc=torch.tensor([0, max_query], dtype=torch.int32),
+        seq_lens=torch.tensor([max_kv], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+    )
+    assert impl.forward(layer, query, None, None, cache, metadata, output) is output
+    assert len(calls) == 1
+    label, args = calls[0]
+    assert label == expected_op and args[11] == expected_bound
+    assert args[5] is metadata.seq_lens and metadata.max_seq_len == max_kv
+    assert args[7] is scale and args[8] is scale and args[9] is scale
+    if group32 and max_query == 1:
+        assert args[-1] == metadata.max_num_splits

@@ -188,7 +188,10 @@ def get_attn_backend(
 
     if backend is None and kv_cache_dtype in ("fp8", "fp8_e4m3"):
         quant_config = vllm_config.quant_config
-        if quant_config is not None and quant_config.get_name() == "compressed-tensors":
+        if quant_config is not None and quant_config.get_name() in (
+            "compressed-tensors",
+            "sm80_group32",
+        ):
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
                 CompressedTensorsConfig,
             )

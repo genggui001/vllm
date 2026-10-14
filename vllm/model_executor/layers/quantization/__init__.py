@@ -25,6 +25,8 @@ QuantizationMethods = Literal[
     "awq_marlin",
     "humming",
     "compressed-tensors",
+    "sm80_qdq_reference",
+    "sm80_group32",
     "experts_int8",
     "quark",
     "moe_wna16",
@@ -134,9 +136,13 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
     from .online.base import OnlineQuantizationConfig
+    from .sm80_group32 import SM80Group32Config
+    from .sm80_qdq_reference import SM80QDQReferenceConfig
     from .torchao import TorchAOConfig
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
+        "sm80_qdq_reference": SM80QDQReferenceConfig,
+        "sm80_group32": SM80Group32Config,
         "awq": AutoAWQConfig,
         "awq_marlin": AutoAWQConfig,
         "auto_awq": AutoAWQConfig,

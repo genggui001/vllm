@@ -1,0 +1,93 @@
+{
+  "date": "2026-10-14",
+  "delivery": "source branch; no new wheel",
+  "source_base": "314f661deac20a1eec66308f19493adafc4ec428",
+  "release_branch": "v0.29.0-sm80w4a8qkv8",
+  "candidate_registration_sha256": "faa8d700b34fb7ffee0a16eaae3577e7770fd6ebca1d8c0340cd6292fb71e3b3",
+  "typing_only_proof": {
+    "passed": true,
+    "runtime_ast_identical_after_erasing_typing_cast": true,
+    "source_sha256": "566e785d31f50e02844eda3e5b555b07396241416e9688567dfde8ec228818b9"
+  },
+  "evaluated_candidate_registration_sha256": "6dc7e1a6d16a459f45b0249e02a20ec6be8efa3499d53e2b29429a977e681a6b",
+  "runtime_ast_matches_evaluated_package": 2326,
+  "removed_experimental_modules": [
+    "vllm/model_executor/layers/fused_moe/experts/sm80_group32_moe.py",
+    "vllm/model_executor/layers/fused_moe/experts/sm80_group32_fixed_gemm.py",
+    "vllm/model_executor/layers/fused_moe/experts/sm80_group32_native_gemm.py",
+    "vllm/model_executor/layers/fused_moe/experts/sm80_group32_routing.py"
+  ],
+  "validation": {
+    "core_operator_cases": 426,
+    "graph_workspace_cases": 64,
+    "total_passed": 490,
+    "typing_fix_recheck_passed": true,
+    "typing_fix_recheck_cases": 24,
+    "unavailable_upstream_test": {
+      "nodeid": "source/tests/v1/attention/test_gdn_metadata_builder.py::test_gdn_build_classification[mixed_decode_and_spec_decode]",
+      "reason": "Qwen/Qwen3.5-0.8B HF configuration absent in offline test environment; no model downloaded",
+      "result": "not passed; retained in evidence"
+    },
+    "harness_failures": [
+      "tests-r1 missing tests.v1 import path",
+      "tests-r2 symlink provenance assertion"
+    ],
+    "smoke": [
+      {
+        "mtp_tokens": 0,
+        "requests": 4,
+        "repeated_prefix_cached_tokens": [
+          1584,
+          1584
+        ],
+        "passed": true,
+        "scope": "TP2 small-batch generation and actual prefix hits; not full feature scoring or long stress"
+      },
+      {
+        "mtp_tokens": 3,
+        "requests": 4,
+        "repeated_prefix_cached_tokens": [
+          1088,
+          1088
+        ],
+        "passed": true,
+        "scope": "TP2 small-batch generation and actual prefix hits; not full feature scoring or long stress"
+      }
+    ],
+    "full_scores": [
+      {
+        "mode": "base",
+        "datasets": 42,
+        "mean": 73.11090659752482,
+        "accepted_r24_mean": 73.14841200137077,
+        "delta_pp": -0.03750540384596582
+      },
+      {
+        "mode": "r",
+        "datasets": 42,
+        "mean": 75.07304798373863,
+        "accepted_r24_mean": 75.1771040805252,
+        "delta_pp": -0.10405609678657395
+      },
+      {
+        "mode": "enr",
+        "datasets": 42,
+        "mean": 75.71231911850816,
+        "accepted_r24_mean": 76.09507765035866,
+        "delta_pp": -0.3827585318505098
+      }
+    ],
+    "full_score_tasks": 126,
+    "full_score_requests": 31989,
+    "scores_prefix_mtp": false,
+    "speed_prefix_mtp": false,
+    "full_model_cross_load_bit_equality": false,
+    "old_backend_full_dataset_rerun": false,
+    "cascade_tested": false,
+    "new_wheel_built": false,
+    "OMP_forced": false,
+    "lint": "ruff 0.14.0 check and format for 42 Python files; git diff --check"
+  },
+  "evidence_directory": "/mnt/nas/home/genggui/code/vllm-sm80-group32-fast-evidence-20260929/marlin-prepared-20261013/release-20261014-r1",
+  "pending": "See deferred_optimizations.json; user requested publishing current version and deferring further optimization."
+}

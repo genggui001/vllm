@@ -8,6 +8,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -23,6 +24,10 @@ from vllm.v1.attention.backends.flash_attn import (
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 try:
     importlib.import_module("vllm.vllm_flash_attn._vllm_fa2_sm80_fp8_C")
@@ -32,6 +37,9 @@ except ImportError as exc:
     _EXTENSION_ERROR = str(exc)
 
 logger = init_logger(__name__)
+
+_GROUP32_PREFILL_DEFAULT_BUDGET = 256 * 1024 * 1024
+_GROUP32_PREFILL_WORKSPACE_LIMIT = 1536 * 1024 * 1024
 
 
 class FlashAttentionQkvFp8Sm80FusedMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -159,6 +167,8 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         # Q quantization is performed exactly once by the custom CUDA kernel.
         self.supports_quant_query_input = False
+        self._group32_prefill_budget = 0
+        self._group32_decode_bound = 0
         if _EXTENSION_ERROR is not None:
             raise ImportError(
                 "_vllm_fa2_sm80_fp8_C is not installed: " + _EXTENSION_ERROR
@@ -196,6 +206,99 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
         logger.info_once(
             "Using independent FA2-derived SM80 fused Q QDQ + uint8 E4M3FN "
             "paged K/V decode (static per-layer scales; cascade supported)"
+        )
+
+    def prepare_group32_decode(self) -> None:
+        """Keep split-KV reduction partitions stable across Graph fallback."""
+        config = get_current_vllm_config()
+        if (
+            not config.model_config.enforce_eager
+            and config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            self._group32_decode_bound = config.model_config.max_model_len
+
+    def prepare_group32_prefill(self) -> None:
+        """Reserve shared staging during model construction, before KV sizing."""
+        if not is_workspace_manager_initialized():
+            return
+        config = get_current_vllm_config()
+        scheduler = config.scheduler_config
+        max_model_len = config.model_config.max_model_len
+        max_q = min(
+            scheduler.max_num_batched_tokens,
+            max_model_len * scheduler.max_num_seqs,
+        )
+        if max_q <= 16:
+            return
+        max_batch = min(scheduler.max_num_seqs, max_q)
+        pages = (max_model_len + 15) // 16
+        upper_bound = max_q * self.num_heads * (self.head_size * 2 + 4)
+        upper_bound += (
+            max_batch * pages * (4 * 16 * self.num_kv_heads * self.head_size + 4)
+        )
+        self._group32_prefill_budget = min(
+            _GROUP32_PREFILL_WORKSPACE_LIMIT, (upper_bound + 255) // 256 * 256
+        )
+        current_workspace_manager().reserve_for_all_ubatches(
+            self._group32_prefill_budget
+        )
+
+    def _needs_expanded_group32_prefill(
+        self, total_q: int, batch: int, max_query: int, max_kv: int
+    ) -> bool:
+        if max_query <= 16:
+            return False
+        # Match the native 16-token staging layout, including its LSE allowance.
+        pages = (max_kv + 15) // 16
+        required = total_q * self.num_heads * (self.head_size * 2 + 4)
+        required += batch * pages * (4 * 16 * self.num_kv_heads * self.head_size + 4)
+        return (
+            _GROUP32_PREFILL_DEFAULT_BUDGET < required <= self._group32_prefill_budget
+        )
+
+    def _forward_group32_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqused_k: torch.Tensor,
+        block_table: torch.Tensor,
+        q_scale: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale: float,
+        is_causal: bool,
+    ) -> list[torch.Tensor]:
+        args = (
+            query,
+            key,
+            value,
+            output,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            q_scale,
+            k_scale,
+            v_scale,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            is_causal,
+        )
+        ops = torch.ops._vllm_fa2_sm80_fp8_C
+        if not self._needs_expanded_group32_prefill(
+            query.shape[0], cu_seqlens_q.numel() - 1, max_seqlen_q, max_seqlen_k
+        ):
+            return ops.varlen_fwd_lse(*args)
+        (workspace,) = current_workspace_manager().get_simultaneous(
+            ((self._group32_prefill_budget,), torch.uint8)
+        )
+        return ops.varlen_fwd_group32_prefill_workspace_lse(
+            *args, self._group32_prefill_budget, workspace
         )
 
     def do_kv_cache_update(
@@ -273,6 +376,44 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
 
         query = query[:num_actual_tokens]
         actual_output = output[:num_actual_tokens]
+
+        if packed_decode and getattr(layer, "_sm80_group32_decode", False):
+            if prequantized_q:
+                raise ValueError("Group32 split-KV requires an unquantized query")
+            torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_group32(
+                query,
+                key_cache,
+                value_cache,
+                actual_output,
+                attn_metadata.query_start_loc,
+                attn_metadata.seq_lens,
+                attn_metadata.block_table,
+                layer._q_scale,
+                layer._k_scale,
+                layer._v_scale,
+                attn_metadata.max_query_len,
+                max(attn_metadata.max_seq_len, self._group32_decode_bound),
+                self.scale,
+                bool(attn_metadata.causal),
+                attn_metadata.max_num_splits,
+            )
+            return output
+
+        if (
+            self._group32_prefill_budget > 0
+            and getattr(layer, "_sm80_group32_decode", False)
+            and not prequantized_q
+            and (
+                attn_metadata.use_cascade
+                or self._needs_expanded_group32_prefill(
+                    num_actual_tokens,
+                    attn_metadata.query_start_loc.numel() - 1,
+                    attn_metadata.max_query_len,
+                    attn_metadata.max_seq_len,
+                )
+            )
+        ):
+            fwd = fwd_lse = self._forward_group32_prefill
 
         if not attn_metadata.use_cascade:
             fwd(

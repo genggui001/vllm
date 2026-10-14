@@ -22,6 +22,9 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.marlin_fp8_qdq_fused_moe import (
     MarlinFp8QdqFusedExperts,
 )
+from vllm.model_executor.layers.fused_moe.experts.marlin_group32_fp8_qdq import (
+    MarlinGroup32Fp8QdqExperts,
+)
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     BatchedMarlinExperts,
     MarlinExperts,
@@ -54,6 +57,7 @@ logger = init_logger(__name__)
 class WNA16MoEBackend(Enum):
     MARLIN = "MARLIN"
     MARLIN_FP8_QDQ_FUSED = "MARLIN_FP8_QDQ_FUSED"
+    MARLIN_GROUP32_FP8_QDQ = "MARLIN_GROUP32_FP8_QDQ"
     BATCHED_MARLIN = "BATCHED_MARLIN"
     HUMMING = "HUMMING"
     CPU = "CPU"
@@ -83,6 +87,8 @@ def backend_to_kernel_cls(
         return [MarlinExperts]
     elif backend == WNA16MoEBackend.MARLIN_FP8_QDQ_FUSED:
         return [MarlinFp8QdqFusedExperts]
+    elif backend == WNA16MoEBackend.MARLIN_GROUP32_FP8_QDQ:
+        return [MarlinGroup32Fp8QdqExperts]
     elif backend == WNA16MoEBackend.BATCHED_MARLIN:
         return [BatchedMarlinExperts]
     elif backend == WNA16MoEBackend.FLASHINFER_TRTLLM:
@@ -138,6 +144,8 @@ def _backend_incompatibility_reason(
     may_have_bias: bool,
     allow_tile_padding: bool,
 ) -> str | None:
+    if backend == WNA16MoEBackend.MARLIN_GROUP32_FP8_QDQ:
+        return "group32 FP8 QDQ requires the sm80_group32 quantization method"
     if backend == WNA16MoEBackend.FLASHINFER_TRTLLM and (may_have_zp or may_have_bias):
         return "zero points and bias are not supported"
 
@@ -193,6 +201,7 @@ def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
         "triton": WNA16MoEBackend.TRITON,
         "marlin": WNA16MoEBackend.MARLIN,
         "marlin_fp8_qdq_fused": WNA16MoEBackend.MARLIN_FP8_QDQ_FUSED,
+        "marlin_group32_fp8_qdq": WNA16MoEBackend.MARLIN_GROUP32_FP8_QDQ,
         "humming": WNA16MoEBackend.HUMMING,
         "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
         "emulation": WNA16MoEBackend.EMULATION,
@@ -402,6 +411,7 @@ def make_wna16_moe_kernel(
     allowed_experts: tuple[type[mk.FusedMoEExperts], ...] = (
         MarlinExperts,
         MarlinFp8QdqFusedExperts,
+        MarlinGroup32Fp8QdqExperts,
         BatchedMarlinExperts,
         TritonWNA16Experts,
         TrtLlmMxint4ExpertsMonolithic,

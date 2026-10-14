@@ -1,5 +1,10 @@
 # SM80 W4A8 QKV8 serving
 
+For the v20.1 INT4/FP8 **group32** checkpoint, see
+[the group32 release instructions](../sm80_group32/INSTALL_AND_USAGE.md).
+It selects the separate `marlin_group32_fp8_qdq` backend automatically; the
+group128/token-FP8 backend described below retains its existing behavior.
+
 This branch adds `FLASH_ATTN_QKV_FP8_SM80_FUSED` attention and
 `marlin_fp8_qdq_fused` experts to vLLM 0.29.0. It retains the measured Prefill
 staging implementation, adaptive Decode kernels, incremental block-table

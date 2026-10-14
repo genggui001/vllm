@@ -35,6 +35,9 @@ class CudagraphDispatcher:
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
         self.uniform_decode_query_len = 1 + self.vllm_config.num_speculative_tokens
+        self._exact_piecewise_tokens = (
+            getattr(vllm_config.model_config, "quantization", None) == "sm80_group32"
+        )
 
         # Dict to store valid cudagraph dispatching keys.
         self.cudagraph_keys: dict[CUDAGraphMode, set[BatchDescriptor]] = {
@@ -319,7 +322,10 @@ class CudagraphDispatcher:
             # also check if the relaxed key exists for more "general"
             # piecewise cudagraph
             batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)
-            if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
+            if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE] and (
+                not self._exact_piecewise_tokens
+                or batch_desc_to_check.num_tokens == num_tokens
+            ):
                 return CUDAGraphMode.PIECEWISE, batch_desc_to_check
 
         assert CUDAGraphMode.NONE in allowed_modes, (

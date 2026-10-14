@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
@@ -30,6 +31,51 @@ namespace FLASH_NAMESPACE {
 using torch::headeronly::ScalarType;
 using torch::stable::Tensor;
 
+// Match the pinned native FA2 split-count heuristic for group32 decode.
+inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs,
+                                int num_n_blocks, int max_splits) {
+  // If we have enough to almost fill the SMs, then just use 1 split
+  if (batch_nheads_mblocks >= 0.8f * num_SMs) {
+    return 1;
+  }
+  max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+  float max_efficiency = 0.f;
+  std::vector<float> efficiency;
+  efficiency.reserve(max_splits);
+  auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+  // Some splits are not eligible. For example, if we have 64 blocks and choose
+  // 11 splits, we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have
+  // 6 * 11 + (-2) blocks (i.e. it's 11 splits anyway). So we check if the
+  // number of blocks per split is the same as the previous num_splits.
+  auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
+    return num_splits == 1 || ceildiv(num_n_blocks, num_splits) !=
+                                  ceildiv(num_n_blocks, num_splits - 1);
+  };
+  for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+    if (!is_split_eligible(num_splits)) {
+      efficiency.push_back(0.f);
+    } else {
+      float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+      float eff = n_waves / ceil(n_waves);
+      // printf("num_splits = %d, eff = %f\n", num_splits, eff);
+      if (eff > max_efficiency) {
+        max_efficiency = eff;
+      }
+      efficiency.push_back(eff);
+    }
+  }
+  for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+    if (!is_split_eligible(num_splits)) {
+      continue;
+    }
+    if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
+      // printf("num_splits chosen = %d\n", num_splits);
+      return num_splits;
+    }
+  }
+  return 1;
+}
+
 static inline cudaStream_t get_current_cuda_stream_sm80_fp8(const Tensor& t) {
   void* stream_ptr = nullptr;
   TORCH_ERROR_CODE_CHECK(
@@ -47,13 +93,46 @@ static void check_scale(const Tensor& scale, const Tensor& reference,
                   name, " must be on the same device as q");
 }
 
+static void check_stage_workspace(const Tensor& workspace, const Tensor& q,
+                                  int64_t budget,
+                                  std::initializer_list<const Tensor*> inputs) {
+  CHECK_DEVICE(workspace);
+  CHECK_CONTIGUOUS(workspace);
+  STD_TORCH_CHECK(workspace.get_device_index() == q.get_device_index(),
+                  "workspace must be on the same device as q");
+  STD_TORCH_CHECK(
+      workspace.scalar_type() == ScalarType::Byte && workspace.dim() == 1,
+      "workspace must be a one-dimensional uint8 tensor");
+  STD_TORCH_CHECK(workspace.numel() >= budget,
+                  "workspace is smaller than stage_budget_bytes");
+  const auto start = reinterpret_cast<uintptr_t>(workspace.data_ptr());
+  STD_TORCH_CHECK((start & 255U) == 0, "workspace must be 256-byte aligned");
+  if (workspace.numel() == 0) return;
+  const auto end = start + workspace.numel();
+  // Include stride gaps: K/V and block tables can be noncontiguous views.
+  for (const auto* tensor : inputs) {
+    if (tensor->numel() == 0) continue;
+    const auto input_start = reinterpret_cast<uintptr_t>(tensor->data_ptr());
+    uintptr_t last = 0;
+    for (int64_t i = 0; i < tensor->dim(); ++i) {
+      STD_TORCH_CHECK(tensor->stride(i) >= 0, "negative strides unsupported");
+      last += uintptr_t(tensor->size(i) - 1) * tensor->stride(i);
+    }
+    const auto input_end = input_start + (last + 1) * tensor->element_size();
+    STD_TORCH_CHECK(end <= input_start || input_end <= start,
+                    "workspace must not overlap attention inputs or output");
+  }
+}
+
 static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
     const Tensor& q, const Tensor& k, const Tensor& v, Tensor out,
     const Tensor& cu_seqlens_q, const Tensor& seqused_k,
     const Tensor& block_table, const Tensor& q_scale, const Tensor& k_scale,
     const Tensor& v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
     double softmax_scale, bool is_causal, bool return_softmax_lse,
-    bool prequantized_q = false) {
+    bool prequantized_q = false, bool group32_decode = false,
+    int64_t num_splits = 0, int64_t stage_budget = 256LL * 1024 * 1024,
+    const Tensor* stage_workspace = nullptr) {
   CHECK_DEVICE(q);
   torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
   const auto [cc_major, cc_minor] =
@@ -157,6 +236,11 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
             tensor->stride(2) % 8 == 0,
         "k and v must have 8-byte-aligned pages, rows and heads");
   }
+  if (stage_workspace != nullptr) {
+    check_stage_workspace(*stage_workspace, q, stage_budget,
+                          {&q, &k, &v, &out, &cu_seqlens_q, &seqused_k,
+                           &block_table, &q_scale, &k_scale, &v_scale});
+  }
   if (total_q == 0) {
     auto lse = torch::stable::new_empty(q, {num_heads, 0}, ScalarType::Float);
     return return_softmax_lse ? std::vector<Tensor>{out, lse}
@@ -174,11 +258,23 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
       max_seqlen_q == 1 && total_q == batch_size && q_head_groups > 1;
   const int kernel_num_heads = pack_decode_gqa ? num_heads_k : num_heads;
   const int kernel_seqlen_q = pack_decode_gqa ? q_head_groups : max_seqlen_q;
+  int splits = 1;
+  if (group32_decode) {
+    STD_TORCH_CHECK(pack_decode_gqa && q_head_groups <= 16 && !prequantized_q,
+                    "Group32 split-KV requires raw Q, one query per sequence, "
+                    "and 2..16 query heads per KV head");
+    STD_TORCH_CHECK(num_splits >= 0 && num_splits <= 128,
+                    "Group32 num_splits must be in [0, 128]");
+    splits = num_splits > 0
+                 ? int(num_splits)
+                 : num_splits_heuristic(batch_size * kernel_num_heads,
+                                        get_num_sm(get_current_device()) * 2,
+                                        (max_seqlen_k + 63) / 64, 128);
+  }
   // Bound temporary BF16 storage independently of the persistent FP8 cache.
   // Small queries retain the current decode kernel and allocate no workspace.
   const int64_t stage_pages =
       (max_seqlen_k + page_block_size - 1) / page_block_size;
-  constexpr int64_t stage_budget = 256LL * 1024 * 1024;
   const int64_t q_and_lse_bytes =
       int64_t(total_q) * num_heads * (head_size * 2 + 4);
   const int64_t bytes_per_page =
@@ -188,7 +284,9 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
       int64_t(batch_size) * stage_pages <=
           (stage_budget - q_and_lse_bytes) / bytes_per_page;
   auto softmax_lse = torch::stable::new_empty(
-      q, {num_heads, (return_softmax_lse || stage_prefill) ? total_q : 0},
+      q,
+      {num_heads,
+       (return_softmax_lse || stage_prefill || splits > 1) ? total_q : 0},
       ScalarType::Float);
   Flash_fwd_sm80_fp8_params params{};
   params.q_ptr = q.data_ptr();
@@ -209,8 +307,9 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
   params.o_row_stride = pack_decode_gqa ? out.stride(1) : out.stride(0);
   params.o_head_stride =
       pack_decode_gqa ? q_head_groups * out.stride(1) : out.stride(1);
-  params.softmax_lse_ptr =
-      (return_softmax_lse || stage_prefill) ? softmax_lse.data_ptr() : nullptr;
+  params.softmax_lse_ptr = (return_softmax_lse || stage_prefill || splits > 1)
+                               ? softmax_lse.data_ptr()
+                               : nullptr;
   params.cu_seqlens_q =
       pack_decode_gqa ? nullptr : static_cast<int*>(cu_seqlens_q.data_ptr());
   // Paged K/V addresses do not use sum_s_k. seqused_k is authoritative.
@@ -252,7 +351,30 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
   params.return_softmax_lse = return_softmax_lse;
 
   const auto stream = get_current_cuda_stream_sm80_fp8(q);
-  if (stage_prefill) {
+  if (splits > 1) {
+    auto partial = torch::stable::new_empty(
+        q, {splits, batch_size, kernel_num_heads, kernel_seqlen_q, head_size},
+        ScalarType::Float);
+    auto partial_lse = torch::stable::new_empty(
+        q, {splits, batch_size, kernel_num_heads, kernel_seqlen_q},
+        ScalarType::Float);
+    params.num_splits = splits;
+    params.oaccum_ptr = partial.data_ptr();
+    params.softmax_lseaccum_ptr = partial_lse.data_ptr();
+    params.seqlenq_ngroups_swapped = true;
+    run_mha_fwd_sm80_fp8_split(params, stream);
+  } else if (stage_prefill && stage_workspace != nullptr) {
+    const int64_t q_bytes = int64_t(total_q) * num_heads * head_size * 2;
+    const int64_t kv_bytes = int64_t(batch_size) * stage_pages *
+                             page_block_size * num_heads_k * head_size * 2;
+    auto* q_ptr = static_cast<char*>(stage_workspace->data_ptr());
+    auto* k_ptr = q_ptr + q_bytes;
+    auto* v_ptr = k_ptr + kv_bytes;
+    auto* table_ptr = reinterpret_cast<int*>(v_ptr + kv_bytes);
+    // Outputs and LSE own their storage and survive reuse by the next call.
+    run_mha_fwd_sm80_fp8_staged(params, q_ptr, k_ptr, v_ptr, table_ptr,
+                                stage_pages, stream, false);
+  } else if (stage_prefill) {
     auto staged_q = torch::stable::new_empty(
         q, {prequantized_q ? 0 : total_q, num_heads, head_size},
         ScalarType::BFloat16);
@@ -322,6 +444,46 @@ std::vector<Tensor> mha_varlen_fwd_sm80_fp8_lse_prequantized_q(
                                       block_table, q_scale, k_scale, v_scale,
                                       max_seqlen_q, max_seqlen_k, softmax_scale,
                                       is_causal, true, true);
+}
+
+std::vector<Tensor> mha_varlen_fwd_sm80_fp8_group32(
+    const Tensor& q, const Tensor& k, const Tensor& v, Tensor out,
+    const Tensor& cu_seqlens_q, const Tensor& seqused_k,
+    const Tensor& block_table, const Tensor& q_scale, const Tensor& k_scale,
+    const Tensor& v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal, int64_t num_splits) {
+  return mha_varlen_fwd_sm80_fp8_impl(
+      q, k, v, out, cu_seqlens_q, seqused_k, block_table, q_scale, k_scale,
+      v_scale, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, false,
+      false, true, num_splits);
+}
+
+std::vector<Tensor> mha_varlen_fwd_sm80_fp8_group32_lse(
+    const Tensor& q, const Tensor& k, const Tensor& v, Tensor out,
+    const Tensor& cu_seqlens_q, const Tensor& seqused_k,
+    const Tensor& block_table, const Tensor& q_scale, const Tensor& k_scale,
+    const Tensor& v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal, int64_t num_splits) {
+  return mha_varlen_fwd_sm80_fp8_impl(q, k, v, out, cu_seqlens_q, seqused_k,
+                                      block_table, q_scale, k_scale, v_scale,
+                                      max_seqlen_q, max_seqlen_k, softmax_scale,
+                                      is_causal, true, false, true, num_splits);
+}
+
+std::vector<Tensor> mha_varlen_fwd_sm80_fp8_group32_prefill_workspace_lse(
+    const Tensor& q, const Tensor& k, const Tensor& v, Tensor out,
+    const Tensor& cu_seqlens_q, const Tensor& seqused_k,
+    const Tensor& block_table, const Tensor& q_scale, const Tensor& k_scale,
+    const Tensor& v_scale, int64_t max_seqlen_q, int64_t max_seqlen_k,
+    double softmax_scale, bool is_causal, int64_t stage_budget_bytes,
+    Tensor workspace) {
+  STD_TORCH_CHECK(
+      stage_budget_bytes >= 0 && stage_budget_bytes <= 2LL * 1024 * 1024 * 1024,
+      "Group32 prefill staging budget must be in [0, 2 GiB]");
+  return mha_varlen_fwd_sm80_fp8_impl(
+      q, k, v, out, cu_seqlens_q, seqused_k, block_table, q_scale, k_scale,
+      v_scale, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, true,
+      false, false, 0, stage_budget_bytes, &workspace);
 }
 
 }  // namespace FLASH_NAMESPACE

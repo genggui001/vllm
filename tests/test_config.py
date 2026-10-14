@@ -2408,3 +2408,48 @@ def test_revision_resolved_when_weights_match_model(mock_resolve):
     assert isinstance(config.revision, ResolvedRevision)
     assert config.revision.resolved == REVISION
     mock_resolve.assert_any_call(model, None, config.hf_token)
+
+
+@pytest.mark.parametrize(
+    "quantization,capability,override,expected",
+    [
+        ("sm80_group32", 80, None, True),
+        ("sm80_group32", 80, "0", False),
+        ("sm80_group32", 80, "1", True),
+        ("sm80_group32", 90, None, False),
+        ("sm80_qdq_reference", 80, None, False),
+        ("compressed-tensors", 80, None, False),
+        (None, 80, None, False),
+    ],
+)
+def test_group32_breakable_default_preserves_explicit_and_legacy_settings(
+    monkeypatch, quantization, capability, override, expected
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    if override is not None:
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", override)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda v: v == capability
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            quantization=quantization,
+        ),
+        compilation_config=CompilationConfig(mode=CompilationMode.VLLM_COMPILE),
+    )
+    config._uses_breakable_cudagraph_by_default = lambda: (
+        VllmConfig._uses_breakable_cudagraph_by_default(config)
+    )
+    try:
+        assert VllmConfig._maybe_enable_breakable_cudagraph(config) is expected
+        assert config.compilation_config.mode == (
+            CompilationMode.NONE if expected else CompilationMode.VLLM_COMPILE
+        )
+        if override is None and not expected:
+            assert "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
+    finally:
+        os.environ.pop("VLLM_USE_BREAKABLE_CUDAGRAPH", None)

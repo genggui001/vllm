@@ -100,3 +100,48 @@ def test_workspace_lane_validation(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="at least one"):
         workspace.WorkspaceManager(torch.device("cpu"), num_lanes=0)
+
+
+def test_startup_reservation_covers_ubatches_without_aliasing_lanes(monkeypatch):
+    """All startup slots must work without growth after graph locking."""
+    active_ubatch = [0]
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: active_ubatch[0])
+    manager = workspace.WorkspaceManager(
+        torch.device("cpu"), num_ubatches=2, num_lanes=2
+    )
+    manager.reserve_for_all_ubatches(512)
+    target_pointers = [
+        ws.data_ptr() for ws in manager._current_workspaces[::2] if ws is not None
+    ]
+    assert len(target_pointers) == 2
+    assert manager._current_workspaces[1::2] == [None, None]
+    with workspace.use_workspace_lane(1):
+        manager.reserve_for_all_ubatches(256)
+    manager.reserve_for_all_ubatches(384)
+    assert [
+        ws.data_ptr() for ws in manager._current_workspaces[::2] if ws is not None
+    ] == target_pointers
+    manager.lock()
+    views: list[torch.Tensor] = []
+    for ubatch in range(2):
+        active_ubatch[0] = ubatch
+        for lane, size in enumerate((512, 256)):
+            with workspace.use_workspace_lane(lane):
+                (view,) = manager.get_simultaneous(((size,), torch.uint8))
+                view.fill_(len(views))
+                views.append(view)
+    assert len({v.data_ptr() for v in views}) == 4
+    assert all(torch.equal(v, torch.full_like(v, i)) for i, v in enumerate(views))
+
+
+def test_startup_reservation_rejects_late_growth_and_invalid_size(monkeypatch):
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_ubatches=2)
+    with pytest.raises(ValueError, match="non-negative"):
+        manager.reserve_for_all_ubatches(-1)
+    manager.reserve_for_all_ubatches(0)
+    assert manager._current_workspaces == [None, None]
+    manager.lock()
+    with pytest.raises(RuntimeError, match="after locking"):
+        manager.reserve_for_all_ubatches(256)
+    assert manager._current_workspaces == [None, None]

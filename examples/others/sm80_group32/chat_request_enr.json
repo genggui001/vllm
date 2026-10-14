@@ -1,0 +1,13 @@
+{
+  "model": "Dayi-v20.1-35b-a3b-group32",
+  "messages": [{"role": "user", "content": "请解释为什么规律作息很重要。"}],
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "min_p": 0.0,
+  "repetition_penalty": 1.0,
+  "max_tokens": 32768,
+  "seed": 20260926,
+  "chat_template_kwargs": {"enable_thinking": true, "use_en_thinking": true},
+  "stream": true,
+  "stream_options": {"include_usage": true}
+}

@@ -415,3 +415,45 @@ def test_divisor_query_len_dispatch_is_unchanged(
         assert desc.cg_mode == CUDAGraphMode.FULL, num_tokens
         assert desc.num_tokens == expected, num_tokens
         assert desc.num_reqs == expected // decode_query_len, num_tokens
+
+
+@pytest.mark.parametrize(
+    "quantization", ["sm80_group32", "sm80_qdq_reference", "compressed-tensors", None]
+)
+@pytest.mark.parametrize("decode_query_len", [1, 4])
+def test_group32_prefill_uses_exact_graphs_without_changing_decode(
+    monkeypatch, quantization, decode_query_len
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform, "get_global_graph_pool", lambda: object()
+    )
+    config = _create_decode_vllm_config(
+        [1, 2, 4, 8, 16, 32, 128, 512],
+        num_speculative_tokens=decode_query_len - 1,
+    )
+    config.model_config = SimpleNamespace(quantization=quantization)
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+        decode_query_len=decode_query_len,
+    )
+    manager._graphs_captured = True
+    for tokens in (128, 512):
+        desc = manager.dispatch(2, tokens, None, 0)
+        assert (desc.cg_mode, desc.num_tokens) == (CUDAGraphMode.PIECEWISE, tokens)
+    for tokens in (3, 129, 387):
+        desc = manager.dispatch(2, tokens, None, 0)
+        if quantization == "sm80_group32":
+            assert (desc.cg_mode, desc.num_tokens) == (CUDAGraphMode.NONE, tokens)
+        else:
+            assert desc.cg_mode == CUDAGraphMode.PIECEWISE
+            assert desc.num_tokens > tokens
+    desc = manager.dispatch(7, 7 * decode_query_len, decode_query_len, 0)
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert (desc.num_reqs, desc.num_tokens) == (8, 8 * decode_query_len)

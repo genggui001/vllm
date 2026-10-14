@@ -604,3 +604,33 @@ def test_large_graph_padding_policy_preserves_decode(padding_limit):
             CUDAGraphMode.NONE if padding_limit == 512 else CUDAGraphMode.PIECEWISE
         )
         assert batch.num_tokens == (tokens if padding_limit == 512 else 2048)
+
+
+@pytest.mark.parametrize(
+    "quantization", ["sm80_group32", "sm80_qdq_reference", "compressed-tensors", None]
+)
+def test_group32_v1_prefill_requires_exact_size_but_keeps_full_decode(quantization):
+    from types import SimpleNamespace
+
+    compilation = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_capture_sizes=[1, 2, 4, 8, 128, 512],
+    )
+    config = _create_vllm_config(compilation)
+    config.model_config = SimpleNamespace(quantization=quantization)
+    dispatcher = CudagraphDispatcher(config)
+    dispatcher.initialize_cudagraph_keys(
+        compilation.cudagraph_mode, uniform_decode_query_len=1
+    )
+    for tokens in (128, 512):
+        mode, desc = dispatcher.dispatch(tokens)
+        assert (mode, desc.num_tokens) == (CUDAGraphMode.PIECEWISE, tokens)
+    for tokens in (3, 129, 387):
+        mode, desc = dispatcher.dispatch(tokens)
+        if quantization == "sm80_group32":
+            assert (mode, desc.num_tokens) == (CUDAGraphMode.NONE, tokens)
+        else:
+            assert mode == CUDAGraphMode.PIECEWISE and desc.num_tokens > tokens
+    mode, desc = dispatcher.dispatch(3, uniform_decode=True)
+    assert (mode, desc.num_tokens) == (CUDAGraphMode.FULL, 4)

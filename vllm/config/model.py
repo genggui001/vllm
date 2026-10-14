@@ -1256,6 +1256,8 @@ class ModelConfig:
             # `override_quantization_method` method) must be checked in order
             # of preference (this is particularly important for GPTQ).
             overrides = [
+                "sm80_qdq_reference",
+                "sm80_group32",
                 "auto_gptq",
                 "gptq",
                 "gptq_marlin",

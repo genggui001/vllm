@@ -307,7 +307,7 @@ class MoERunner(MoERunnerInterface):
                     and getattr(
                         getattr(self._quant_method, "experts_cls", None), "__name__", ""
                     )
-                    == "MarlinFp8QdqFusedExperts"
+                    in ("MarlinFp8QdqFusedExperts", "MarlinGroup32Fp8QdqExperts")
                 ),
             )
 

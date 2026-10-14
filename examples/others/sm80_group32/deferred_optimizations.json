@@ -1,0 +1,59 @@
+{
+  "status": "deferred_by_user_2026-10-14",
+  "baseline": "current native-prepared group32 release",
+  "constraints": [
+    "Preserve accepted precision and old group128/token-FP8 and W4A16 paths",
+    "Physical GPU0-3 only; inspect occupancy before GPU runs",
+    "Do not force OMP_NUM_THREADS",
+    "Bits before speed and full scores",
+    "Cascade deferred",
+    "Do not resume old R24 medical queue"
+  ],
+  "next": [
+    {
+      "priority": 1,
+      "task": "Compare optional exact 2048-token Graph",
+      "detail": "Formal profile includes 2048; current speed/score capture max512. Check actual 512x4 prefill schedule and bits."
+    },
+    {
+      "priority": 2,
+      "task": "Reuse prepared group32 input in shared expert gate_up projection",
+      "detail": "Keep router/shared gate on original normalized input; avoid redundant QDQ only for matching Dense scheme."
+    },
+    {
+      "priority": 2,
+      "task": "Fuse shared expert training SwiGLU and down-projection group32 QDQ",
+      "detail": "Current Qwen2MoeMLP uses training_swiglu followed by separate Dense QDQ."
+    },
+    {
+      "priority": 3,
+      "task": "Fuse invalid-route mask with existing routing/combine",
+      "detail": "Preserve zero output and stale-workspace protection for all-invalid routes and changing Graph replay."
+    },
+    {
+      "priority": 4,
+      "task": "Tune group32 SwiGLU/QDQ groups and warps",
+      "detail": "Formal tokenwise BF16 width256 LUT uses1 warp; group32 currently2/4. Benchmark rather than copy blindly."
+    },
+    {
+      "priority": 5,
+      "task": "Fuse query QDQ into group32 native-order QK-Norm/RoPE",
+      "detail": "Keep checkpoint FP32 scales and all BF16/FP32 rounding boundaries; split-KV presently requires raw Q."
+    },
+    {
+      "priority": 6,
+      "task": "Attribute cross-load Prefill logits differences",
+      "detail": "Same-input/same-route local bits exact does not establish full-model equality."
+    },
+    {
+      "priority": 7,
+      "task": "Prefix/MTP full accuracy and stress; new OpenCompass wheel",
+      "detail": "No new wheel or full feature scoring claimed by source release."
+    },
+    {
+      "priority": 8,
+      "task": "Cover observed first-query group32 QDQ JIT specialization in prewarm",
+      "detail": "Release Prefix smoke logged _group32_qdq_kernel JIT on first real query after Graph capture; generation passed. Measure cold-start separately; do not modify current release."
+    }
+  ]
+}

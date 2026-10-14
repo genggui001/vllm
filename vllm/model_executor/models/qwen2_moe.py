@@ -107,11 +107,22 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.use_group32_qdq_reference = (
+            quant_config is not None
+            and quant_config.get_name() in ("sm80_qdq_reference", "sm80_group32")
+        )
         self.expert_gate = expert_gate
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        out = self.act_fn(gate_up)
+        if self.use_group32_qdq_reference:
+            from vllm.model_executor.layers.quantization.sm80_qdq_reference import (
+                training_swiglu,
+            )
+
+            out = training_swiglu(gate_up)
+        else:
+            out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:

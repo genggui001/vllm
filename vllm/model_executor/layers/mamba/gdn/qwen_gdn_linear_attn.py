@@ -12,6 +12,7 @@ from torch import nn
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -437,6 +438,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.in_proj_ba",
         )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
+
+        self._sm80_group32_prepare_input = False
+        if (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability(80)
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "sm80_group32"
+        ):
+            from vllm.model_executor.layers.quantization.sm80_group32 import (
+                DenseGroup32Fused,
+            )
+
+            projections = (self.in_proj_qkvz, self.in_proj_ba)
+            self._sm80_group32_prepare_input = all(
+                isinstance(getattr(proj, "scheme", None), DenseGroup32Fused)
+                for proj in projections
+            )
+            if self._sm80_group32_prepare_input:
+                for proj in projections:
+                    proj._sm80_group32_input_prepared = True
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -900,6 +921,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
+        if self._sm80_group32_prepare_input:
+            from vllm.model_executor.layers.quantization.utils.sm80_group32_qdq import (
+                group32_fp8_qdq_fused,
+            )
+
+            hidden_states = group32_fp8_qdq_fused(hidden_states)
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
 
@@ -1533,7 +1560,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
             # Init cache
-            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
+            if (
+                getattr(self, "_sm80_group32_prepare_input", False)
+                and torch.are_deterministic_algorithms_enabled()
+            ):
+                from vllm.model_executor.layers.quantization.utils.sm80_group32_state import (  # noqa: E501
+                    store_group32_gdn_state,
+                )
+
+                store_group32_gdn_state(
+                    ssm_state,
+                    prefill_state_indices,
+                    last_recurrent_state.to(ssm_state.dtype),
+                )
+            else:
+                ssm_state[prefill_state_indices] = last_recurrent_state.to(
+                    ssm_state.dtype
+                )
 
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
@@ -1909,6 +1952,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
 
+@eager_break_during_capture
 def qwen_gdn_attention_core(
     qkv_or_qkvz: torch.Tensor,
     b_or_ba: torch.Tensor,
@@ -1969,6 +2013,7 @@ direct_register_custom_op(
 )
 
 
+@eager_break_during_capture
 def qwen_gdn_attention_core_fused_norm_packed(
     mixed_qkvz: torch.Tensor,
     ba: torch.Tensor,
