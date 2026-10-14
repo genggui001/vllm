@@ -252,6 +252,13 @@ def test_fused_group32_all_finite_bf16_bits(monkeypatch, arithmetic_silu):
     expected = group32_fp8_qdq(training_swiglu(gate_up))
     actual = fused.silu_mul_group32_fp8_qdq_fused(gate_up)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    wide = x.reshape(-1, 256)
+    shared_gate_up = torch.cat((wide, torch.ones_like(wide)), -1)
+    shared_expected = group32_fp8_qdq(training_swiglu(shared_gate_up))
+    shared_actual = fused.silu_mul_group32_fp8_qdq_fused(shared_gate_up)
+    assert torch.equal(
+        shared_actual.view(torch.int16), shared_expected.view(torch.int16)
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1123,3 +1130,161 @@ def test_group32_native_marlin_rejects_backend_that_changes_activation_contract(
                 moe_backend=backend,
             )
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [0, 1, 17, 256, 257, 2048])
+@pytest.mark.parametrize("prepared", [False, True])
+def test_shared_group32_mlp_preserves_gate_and_projection_bits(
+    default_vllm_config, monkeypatch, rows, prepared
+):
+    """Shared gate reads unquantized x; fused MLP preserves both BF16 roundings."""
+    from vllm.model_executor.layers.quantization.sm80_group32 import DenseGroup32Fused
+    from vllm.model_executor.models import qwen2_moe
+
+    class Projection(torch.nn.Module):
+        def __init__(self, input_size, output_size, **kwargs):
+            super().__init__()
+            output_size = (
+                sum(output_size) if isinstance(output_size, list) else output_size
+            )
+            self.weight = torch.nn.Parameter(
+                torch.randn(
+                    output_size, input_size, device="cuda", dtype=torch.bfloat16
+                )
+                / 32,
+                requires_grad=False,
+            )
+            self.scheme = DenseGroup32Fused()
+
+        def forward(self, x):
+            return self.scheme.apply_weights(self, x), None
+
+    class Gate(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.randn(1, 2048, device="cuda", dtype=torch.bfloat16) / 32
+
+        def forward(self, x):
+            return F.linear(x, self.weight), None
+
+    monkeypatch.setattr(qwen2_moe, "MergedColumnParallelLinear", Projection)
+    monkeypatch.setattr(qwen2_moe, "RowParallelLinear", Projection)
+    gate = Gate()
+    mlp = qwen2_moe.Qwen2MoeMLP(
+        2048,
+        256,
+        "silu",
+        SimpleNamespace(get_name=lambda: "sm80_group32"),
+        expert_gate=gate,
+    )
+    x = torch.randn(rows, 4096, device="cuda", dtype=torch.bfloat16)[:, ::2]
+    if rows:
+        x[0, :32] = -0.0
+        x[0, 32:64] *= torch.finfo(torch.bfloat16).tiny
+    xq = group32_fp8_qdq(x)
+    expected = F.linear(
+        group32_fp8_qdq(training_swiglu(F.linear(xq, mlp.gate_up_proj.weight))),
+        mlp.down_proj.weight,
+    ) * F.sigmoid(F.linear(x, gate.weight))
+    actual = mlp(x, prepared_input=xq if prepared else None)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    # The same instance must also support a later call without a prepared tensor.
+    if prepared:
+        actual = mlp(x)
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_shared_group32_fused_activation_graph_uses_new_inputs():
+    """Shared expert shapes preserve bits across Graph replay, including zeros."""
+    from vllm.model_executor.layers.quantization.utils.sm80_group32_qdq import (
+        silu_mul_group32_fp8_qdq_fused,
+    )
+
+    x = torch.randn(17, 512, device="cuda", dtype=torch.bfloat16)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            silu_mul_group32_fp8_qdq_fused(x)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = silu_mul_group32_fp8_qdq_fused(x)
+    for i in range(8):
+        x.normal_()
+        if i == 7:
+            x.zero_()
+        expected = group32_fp8_qdq(training_swiglu(x))
+        graph.replay()
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [0, 1, 17, 256, 2048])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_group32_masked_combine_preserves_native_sum_bits(rows, strided, ids_dtype):
+    """Preserve native sum order and ignore poisoned invalid GEMM slots."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.experts.marlin_group32_fp8_qdq import (
+        MarlinGroup32Fp8QdqExperts,
+    )
+
+    expert = SimpleNamespace(moe_config=SimpleNamespace(num_experts=128))
+    x = torch.randn(
+        rows, 8, 4096 if strided else 2048, device="cuda", dtype=torch.bfloat16
+    )
+    if strided:
+        x = x[..., ::2]
+    ids = torch.randint(
+        -3, 132, (rows, 16 if strided else 8), device="cuda", dtype=ids_dtype
+    )
+    if strided:
+        ids = ids[:, ::2]
+    output = torch.empty(rows, 2048, device="cuda", dtype=x.dtype)
+    expected = torch.empty_like(output)
+    for all_invalid in (False, True):
+        if all_invalid:
+            ids.fill_(128)
+        valid = (ids >= 0) & (ids < 128)
+        x[~valid] = float("nan")
+        if rows:
+            ops.moe_sum(x, expected, torch.where(valid, ids, -1).contiguous())
+        MarlinGroup32Fp8QdqExperts.moe_sum(expert, x, output, ids, None)
+        assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_group32_masked_combine_graph_refreshes_invalid_routes():
+    """A replay must not reuse prior valid IDs or poisoned FC2 workspace."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe.experts.marlin_group32_fp8_qdq import (
+        MarlinGroup32Fp8QdqExperts,
+    )
+
+    expert = SimpleNamespace(moe_config=SimpleNamespace(num_experts=128))
+    x = torch.randn(17, 8, 2048, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(0, 128, (17, 8), device="cuda", dtype=torch.int64)
+    output = torch.empty(17, 2048, device="cuda", dtype=x.dtype)
+    expected = torch.empty_like(output)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            MarlinGroup32Fp8QdqExperts.moe_sum(expert, x, output, ids, None)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        MarlinGroup32Fp8QdqExperts.moe_sum(expert, x, output, ids, None)
+    for turn in range(8):
+        x.normal_()
+        ids.random_(-3, 132)
+        if turn == 7:
+            ids.fill_(-1)
+        valid = (ids >= 0) & (ids < 128)
+        x[~valid] = float("nan")
+        ops.moe_sum(x, expected, torch.where(valid, ids, -1))
+        graph.replay()
+        assert torch.equal(output.view(torch.int16), expected.view(torch.int16))

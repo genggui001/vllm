@@ -35,12 +35,67 @@ def _mask_out_of_range_routes(
     tl.store(Safe + i, tl.where((value >= 0) & (value < E), value, -1), i < N)
 
 
+@triton.jit
+def _group32_masked_moe_sum(
+    Input,
+    Output,
+    IDs,
+    E: tl.constexpr,
+    S0: tl.constexpr,
+    S1: tl.constexpr,
+    S2: tl.constexpr,
+    I0: tl.constexpr,
+    I1: tl.constexpr,
+    B: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * B + tl.arange(0, B)
+    acc = tl.full((B,), 0, tl.float32)
+    # Match native moe_sum's ordered FP32 accumulation. Invalid slots may
+    # contain stale values or NaNs and must not be read.
+    for k in tl.static_range(8):
+        expert = tl.load(IDs + row * I0 + k * I1)
+        valid = (expert >= 0) & (expert < E)
+        value = tl.load(
+            Input + row * S0 + k * S1 + col * S2,
+            valid & (col < 2048),
+            other=0,
+        ).to(tl.float32)
+        acc = tl.where(valid, acc + value, acc)
+    tl.store(Output + row * 2048 + col, acc, col < 2048)
+
+
 class MarlinGroup32Fp8QdqExperts(MarlinExperts):
     """BF16 Marlin inputs, group32 QDQ, and native post-FC2 weighting."""
 
     input_prequantized: bool = False
 
     def moe_sum(self, input, output, topk_ids, expert_map):
+        if (
+            expert_map is None
+            and input.dtype == output.dtype == torch.bfloat16
+            and input.ndim == 3
+            and input.shape[1:] == (8, 2048)
+            and output.shape == (input.shape[0], 2048)
+            and output.is_contiguous()
+            and topk_ids.shape == input.shape[:2]
+            and topk_ids.dtype in (torch.int32, torch.int64)
+        ):
+            rows = input.shape[0]
+            if rows:
+                block = 256 if rows <= 16 else (512 if rows < 2048 else 1024)
+                _group32_masked_moe_sum[(rows, triton.cdiv(2048, block))](
+                    input,
+                    output,
+                    topk_ids,
+                    self.moe_config.num_experts,
+                    *input.stride(),
+                    *topk_ids.stride(),
+                    block,
+                    num_warps=4,
+                    enable_fp_fusion=False,
+                )
+            return
         # Skipped GEMM slots alias reused FC1/FC2 workspace and are not zeroed.
         # Native pad-aware moe_sum must not read those undefined values.
         safe_ids = torch.empty_like(topk_ids, memory_format=torch.contiguous_format)

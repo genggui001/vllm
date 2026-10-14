@@ -139,7 +139,22 @@ class SharedExperts(torch.nn.Module):
         else:
             return SharedExpertsOrder.NO_OVERLAP
 
-    def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:
+    def _forward_layer(
+        self,
+        shared_experts_input: torch.Tensor,
+        prepared_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if prepared_input is not None and getattr(
+            self._layer, "_sm80_group32_shared_fast", False
+        ):
+            return self._layer(shared_experts_input, prepared_input=prepared_input)
+        return self._layer(shared_experts_input)
+
+    def maybe_forward_async(
+        self,
+        shared_experts_input: torch.Tensor,
+        prepared_input: torch.Tensor | None = None,
+    ) -> bool:
         """Enqueue shared experts on the aux stream without waiting for them.
 
         Returns true if the shared experts were enqueued, false otherwise. Call
@@ -156,7 +171,9 @@ class SharedExperts(torch.nn.Module):
         self._input_ready_event[idx].record(current_stream())
         with torch.cuda.stream(self._stream):
             self._input_ready_event[idx].wait(self._stream)
-            self._output[idx] = self._layer(shared_experts_input)
+            self._output[idx] = self._forward_layer(
+                shared_experts_input, prepared_input
+            )
             self._output_ready_event[idx].record(self._stream)
         return True
 
@@ -180,6 +197,7 @@ class SharedExperts(torch.nn.Module):
         self,
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
+        prepared_input: torch.Tensor | None = None,
     ):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
@@ -188,6 +206,8 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        self._output[self._output_idx] = self._layer(shared_experts_input)
+        self._output[self._output_idx] = self._forward_layer(
+            shared_experts_input, prepared_input
+        )
 
         assert self._output[self._output_idx] is not None

@@ -35,7 +35,7 @@ from torch import nn
 from transformers import Qwen2MoeConfig
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -112,15 +112,51 @@ class Qwen2MoeMLP(nn.Module):
             and quant_config.get_name() in ("sm80_qdq_reference", "sm80_group32")
         )
         self.expert_gate = expert_gate
+        self._sm80_group32_shared_fast = False
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "sm80_group32"
+            and get_current_vllm_config().lora_config is None
+        ):
+            from vllm.model_executor.layers.quantization.sm80_group32 import (
+                DenseGroup32Fused,
+            )
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        if self.use_group32_qdq_reference:
+            self._sm80_group32_shared_fast = all(
+                isinstance(getattr(proj, "scheme", None), DenseGroup32Fused)
+                for proj in (self.gate_up_proj, self.down_proj)
+            )
+            if self._sm80_group32_shared_fast:
+                self.gate_up_proj._sm80_group32_input_prepared = True
+                self.down_proj._sm80_group32_input_prepared = True
+
+    def forward(self, x, prepared_input: torch.Tensor | None = None):
+        # Small batches overlap shared work with routed experts. Keep their
+        # original launch sequence to avoid slowing the routed critical path.
+        fuse_shared = self._sm80_group32_shared_fast and x.shape[0] > 256
+        gate_up_input = x
+        if self._sm80_group32_shared_fast:
+            from vllm.model_executor.layers.quantization.utils.sm80_group32_qdq import (
+                group32_fp8_qdq_fused,
+                silu_mul_group32_fp8_qdq_fused,
+            )
+
+            gate_up_input = (
+                prepared_input
+                if fuse_shared and prepared_input is not None
+                else group32_fp8_qdq_fused(x)
+            )
+        gate_up, _ = self.gate_up_proj(gate_up_input)
+        if fuse_shared:
+            out = silu_mul_group32_fp8_qdq_fused(gate_up)
+        elif self.use_group32_qdq_reference:
             from vllm.model_executor.layers.quantization.sm80_qdq_reference import (
                 training_swiglu,
             )
 
             out = training_swiglu(gate_up)
+            if self._sm80_group32_shared_fast:
+                out = group32_fp8_qdq_fused(out)
         else:
             out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)

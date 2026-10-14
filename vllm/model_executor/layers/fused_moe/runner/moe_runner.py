@@ -592,10 +592,11 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_experts_input: torch.Tensor | None,
         order: SharedExpertsOrder,
+        prepared_input: torch.Tensor | None = None,
     ):
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts(shared_experts_input, order)
+            self._shared_experts(shared_experts_input, order, prepared_input)
 
     def _apply_quant_method(
         self,
@@ -616,7 +617,11 @@ class MoERunner(MoERunnerInterface):
         stream, so the results only have to be awaited here.
         """
         self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            shared_experts_input,
+            SharedExpertsOrder.NO_OVERLAP,
+            hidden_states
+            if getattr(self.routed_experts, "_sm80_group32_prepared", False)
+            else None,
         )
 
         if self.routed_experts.quant_method.is_monolithic:
@@ -896,7 +901,10 @@ class MoERunner(MoERunnerInterface):
         shared_experts_overlapping = False
         if self._shared_experts is not None:
             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
-                shared_experts_input
+                shared_experts_input,
+                hidden_states
+                if getattr(self.routed_experts, "_sm80_group32_prepared", False)
+                else None,
             )
 
         # If the Runner holds the gate, apply it after the stream sync,

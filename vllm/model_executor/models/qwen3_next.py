@@ -253,11 +253,14 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        replicated_shared_output = (
-            self.shared_expert(hidden_states)
-            if self.replicate_shared_expert and self.shared_expert is not None
-            else None
-        )
+        replicated_shared_output = None
+        if self.replicate_shared_expert and self.shared_expert is not None:
+            if getattr(self.shared_expert, "_sm80_group32_shared_fast", False):
+                replicated_shared_output = self.shared_expert(
+                    hidden_states, prepared_input=prepared_hidden_states
+                )
+            else:
+                replicated_shared_output = self.shared_expert(hidden_states)
         if prepared_hidden_states is not None:
             assert not self.is_sequence_parallel
             final_hidden_states = self.experts(
