@@ -20,7 +20,7 @@ enum class Family {
   Generic,
   DecodeQKV,
   DecodeOut,
-  SmallN,
+  NarrowN,
   SmallNCompact,
   SharedA,
   Wide,
@@ -40,6 +40,28 @@ struct Plan {
 int64_t padded_n(int64_t n) { return n <= 32 ? 64 : ((n + 127) / 128) * 128; }
 
 Plan select_plan(int64_t m, int64_t n, int64_t width) {
+  // Decode and short prefill need enough independent CTAs to fill SM80.
+  // Reuse the verified 16x64x128 FP8 tile and ordered FP32 split-K reducer;
+  // do not route M=16 through the serial 16x128x32 generic K loop.
+  if (m <= 256 && width == 2048) {
+    if (n == 6144 && m > 8) {
+      const int split = m <= 16 ? 4 : (m <= 32 ? 2 : 1);
+      return {Family::NarrowN, 16, 64, split, 128, 32768};
+    }
+    if (n == 2048 && m > 8) {
+      const int split =
+          m <= 16 ? 8 : (m <= 32 ? 4 : (m <= 64 ? 2 : (m <= 128 ? 1 : 2)));
+      return {Family::NarrowN, 16, 64, split, 128, 32768};
+    }
+    if (n == 512) {
+      const int split = m <= 16 ? 16 : (m <= 64 ? 8 : (m <= 128 ? 4 : 2));
+      return {Family::NarrowN, 16, 64, split, 128, 32768};
+    }
+    if (n <= 32)
+      return {Family::NarrowN, 16, 64, m <= 128 ? 16 : 8, 128, 32768};
+  }
+  if (m <= 128 && n == 2048 && width == 256)
+    return {Family::NarrowN, 16, 64, 1, 128, 32768};
   if (n == 6144 && width == 2048) {
     if (m <= 8) return {Family::DecodeQKV, 8, 256, 16, 128, 32768};
     if (m == 2048 || m == 8192)
@@ -64,7 +86,7 @@ Plan select_plan(int64_t m, int64_t n, int64_t width) {
     if (width == 2048 && (m == 2048 || m == 4096))
       return {Family::SmallNCompact, 32, 64, 1, 128, 49152};
     const int split = width == 2048 ? (m == 512 ? 8 : (m == 1024 ? 4 : 1)) : 1;
-    return {Family::SmallN, 16, 64, split, 128, 32768};
+    return {Family::NarrowN, 16, 64, split, 128, 32768};
   }
   // The same FP8/G32 contract, including arbitrary M tails. No BF16 GEMM.
   return {Family::Generic, 16, 128, 1, 128, 32768};
@@ -86,7 +108,7 @@ auto kernel_for(Family f) {
                        vllm::kBFloat16.id(),
                        vllm::ScalarType::float_IEEE754(8, 23).id(), 128, 1, 8,
                        4, true, 2, 2, false, false>;
-    case Family::SmallN:
+    case Family::NarrowN:
       return k::Marlin<vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
                        vllm::kBFloat16.id(),
                        vllm::ScalarType::float_IEEE754(8, 23).id(), 128, 1, 4,

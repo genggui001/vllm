@@ -1368,7 +1368,21 @@ def test_dense_fp8_rejects_bias_and_invalid_scales_during_loading(default_vllm_c
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("shape", [(8, 6144, 2048), (1024, 1024, 4096)])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (8, 6144, 2048),
+        (16, 6144, 2048),
+        (16, 2048, 2048),
+        (16, 512, 2048),
+        (16, 2048, 256),
+        (16, 32, 2048),
+        (17, 6144, 2048),
+        (129, 2048, 2048),
+        (256, 32, 2048),
+        (1024, 1024, 4096),
+    ],
+)
 def test_dense_fp8_graph_refresh_and_concurrent_workspaces(shape, default_vllm_config):
     """Split partials/locks are private to each call and read fresh FP8 inputs."""
     from vllm.model_executor.layers.quantization.sm80_group32 import DenseGroup32Fused
