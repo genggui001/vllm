@@ -45,6 +45,18 @@ def _round_e4m3(values):
     return tl.where(values == values, result, float("nan"))
 
 
+@triton.jit
+def _encode_e4m3(rounded):
+    """Encode already-rounded finite E4M3 values without SM89 conversion."""
+    bits = rounded.to(tl.int32, bitcast=True)
+    magnitude = tl.abs(rounded)
+    normal = ((bits & 0x7FFFFFFF) >> 20) - 960
+    subnormal = (magnitude * 512.0).to(tl.int32)
+    code = tl.where(magnitude < 0.015625, subnormal, normal)
+    code = tl.where(rounded == rounded, code, 127)
+    return (code | ((bits >> 24) & 128)).to(tl.uint8)
+
+
 @triton.jit(do_not_specialize=["rows"])
 def _group32_qdq_kernel(
     X,
@@ -63,6 +75,10 @@ def _group32_qdq_kernel(
     ROUTED: tl.constexpr,
     LOOKUP: tl.constexpr,
     GROUPS: tl.constexpr,
+    Q=None,
+    S=None,
+    WRITE_FP8: tl.constexpr = False,
+    WRITE_BF16: tl.constexpr = True,
 ):
     groups_per_row: tl.constexpr = WIDTH // 32
     group = tl.program_id(0) * GROUPS + tl.arange(0, GROUPS)
@@ -97,7 +113,15 @@ def _group32_qdq_kernel(
     # reciprocal. div.rn(absmax, 448) differs at FP8 and BF16 halfway values.
     scale = tl.maximum(absmax * (1.0 / 448.0), 1.1754943508222875e-38)
     normalized = tl.clamp(tl.div_rn(value, scale[:, None]), -448.0, 448.0)
-    result = (_round_e4m3(normalized) * scale[:, None]).to(tl.bfloat16)
+    rounded = _round_e4m3(normalized)
+    if WRITE_FP8:
+        tl.store(
+            Q + row[:, None].to(tl.int64) * WIDTH + col,
+            _encode_e4m3(rounded),
+            row[:, None] < rows,
+        )
+        tl.store(S + group, scale, row < rows)
+    result = (rounded * scale[:, None]).to(tl.bfloat16)
     if PROBABILITY:
         if ROUTED:
             slot = tl.load(Order + row * order_stride, row < rows, 0).to(tl.int64)
@@ -106,7 +130,58 @@ def _group32_qdq_kernel(
         prob = tl.load(P + slot * prob_stride, row < rows, 0)
         # FC2 consumes BF16(QDQ(activation) * FP32(router_probability)).
         result = (result.to(tl.float32) * prob[:, None]).to(tl.bfloat16)
-    tl.store(Y + row[:, None].to(tl.int64) * WIDTH + col, result, row[:, None] < rows)
+    if WRITE_BF16:
+        tl.store(
+            Y + row[:, None].to(tl.int64) * WIDTH + col, result, row[:, None] < rows
+        )
+
+
+def group32_fp8_quant(
+    x: torch.Tensor, *, swiglu: bool = False, return_qdq: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Produce Dense FP8 input and optionally the existing MoE BF16 input."""
+    width = _validate_input(x, swiglu=swiglu)
+    rows = x.shape[0]
+    codes = torch.empty((rows, width), dtype=torch.uint8, device=x.device)
+    scales = torch.empty((rows, width // 32), dtype=torch.float32, device=x.device)
+    qdq = (
+        torch.empty((rows, width), dtype=x.dtype, device=x.device)
+        if return_qdq
+        else None
+    )
+    groups, warps = 8, 4
+    if swiglu and width == 256:
+        groups = 16 if rows >= 256 else 8
+        warps = 2 if rows >= 8192 else 4
+    table = (
+        _training_silu_table(x) if swiglu and (width != 256 or rows >= 2048) else None
+    )
+    if rows:
+        _group32_qdq_kernel[(triton.cdiv(rows * width // 32, groups),)](
+            x,
+            qdq if qdq is not None else x,
+            x,
+            x,
+            table if table is not None else x,
+            rows,
+            x.stride(0),
+            x.stride(1),
+            0,
+            0,
+            WIDTH=width,
+            SWIGLU=swiglu,
+            PROBABILITY=False,
+            ROUTED=False,
+            LOOKUP=table is not None,
+            GROUPS=groups,
+            Q=codes,
+            S=scales,
+            WRITE_FP8=True,
+            WRITE_BF16=return_qdq,
+            num_warps=warps,
+            enable_fp_fusion=False,
+        )
+    return codes.view(torch.float8_e4m3fn), scales, qdq
 
 
 def _validate_input(x: torch.Tensor, *, swiglu: bool) -> int:

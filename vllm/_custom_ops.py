@@ -4368,6 +4368,14 @@ def hadacore_transform(x: torch.Tensor, inplace: bool = True) -> torch.Tensor:
     return torch.ops._C.hadacore_transform(x, inplace)
 
 
+if hasattr(torch.ops._C, "sm80_fp8_g32_gemm"):
+
+    @register_fake("_C::sm80_fp8_g32_gemm")
+    def _sm80_fp8_g32_gemm_fake(a, sa, w, sw, auxiliary, n: int):
+        pn = 64 if n <= 32 else ((n + 127) // 128) * 128
+        return torch.empty((a.shape[0], pn), device=a.device, dtype=torch.bfloat16)
+
+
 if hasattr(torch.ops._C, "hadacore_transform"):
 
     @register_fake("_C::hadacore_transform")

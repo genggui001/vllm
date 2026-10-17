@@ -244,6 +244,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
         prepared_hidden_states: torch.Tensor | None = None,
+        prepared_shared_fp8=None,
     ) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
@@ -257,7 +258,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.replicate_shared_expert and self.shared_expert is not None:
             if getattr(self.shared_expert, "_sm80_group32_shared_fast", False):
                 replicated_shared_output = self.shared_expert(
-                    hidden_states, prepared_input=prepared_hidden_states
+                    hidden_states, prepared_input=prepared_shared_fp8
                 )
             else:
                 replicated_shared_output = self.shared_expert(hidden_states)
@@ -267,6 +268,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 hidden_states=prepared_hidden_states,
                 router_logits=hidden_states,
                 shared_experts_input=hidden_states,
+                prepared_shared_fp8=prepared_shared_fp8,
             )
         else:
             final_hidden_states = self.experts(
@@ -555,8 +557,11 @@ class Qwen3NextAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        prepared_fp8=None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(
+            prepared_fp8 if prepared_fp8 is not None else hidden_states
+        )
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         # The FP8 backend quantizes Q in FA2 and K/V in the cache writer.
         if self.use_group32_qdq_reference and not self.use_group32_fp8_attention:
@@ -678,7 +683,21 @@ class Qwen3NextDecoderLayer(nn.Module):
     ):
         full_num_tokens = positions.shape[-1]
 
-        if residual is None:
+        prepared_fp8 = None
+        if getattr(self, "_sm80_group32_norm_qdq", False):
+            from vllm.model_executor.layers.quantization.utils.sm80_group32_norm import (  # noqa: E501
+                residual_norm_group32_qdq,
+            )
+
+            hidden_states, _, residual, prepared_fp8 = residual_norm_group32_qdq(
+                hidden_states,
+                residual,
+                self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+                emit_fp8=True,
+                emit_qdq=False,
+            )
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
@@ -689,11 +708,14 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = hidden_states[:full_num_tokens]
 
         if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn(hidden_states=hidden_states)
+            hidden_states = self.linear_attn(
+                hidden_states=hidden_states, prepared_fp8=prepared_fp8
+            )
         elif self.layer_type == "full_attention":
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
                 positions=positions,
+                prepared_fp8=prepared_fp8,
             )
         else:
             raise ValueError("Invalid layer_type")
@@ -720,15 +742,20 @@ class Qwen3NextDecoderLayer(nn.Module):
         if getattr(self, "_sm80_group32_norm_qdq", False):
             from vllm.model_executor.layers.quantization.utils import sm80_group32_norm
 
-            hidden_states, prepared, residual = (
+            hidden_states, prepared, residual, prepared_shared_fp8 = (
                 sm80_group32_norm.residual_norm_group32_qdq(
                     hidden_states,
                     residual,
                     self.post_attention_layernorm.weight,
                     self.post_attention_layernorm.variance_epsilon,
+                    emit_fp8=True,
                 )
             )
-            hidden_states = self.mlp(hidden_states, prepared_hidden_states=prepared)
+            hidden_states = self.mlp(
+                hidden_states,
+                prepared_hidden_states=prepared,
+                prepared_shared_fp8=prepared_shared_fp8,
+            )
         elif getattr(self, "_sm80_norm_qdq", False):
             normalized, prepared = norm_qdq_deferred_op(
                 hidden_states,

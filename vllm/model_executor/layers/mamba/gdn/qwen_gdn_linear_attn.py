@@ -455,9 +455,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 isinstance(getattr(proj, "scheme", None), DenseGroup32Fused)
                 for proj in projections
             )
-            if self._sm80_group32_prepare_input:
-                for proj in projections:
-                    proj._sm80_group32_input_prepared = True
+
+        if self._sm80_group32_prepare_input and self.head_v_dim not in (128, 256):
+            raise ValueError("SM80 FP8 GDN Norm requires head width 128/256")
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -849,7 +849,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prepared_fp8=None,
     ) -> torch.Tensor:
+        if prepared_fp8 is not None:
+            return self.forward_cuda(hidden_states, prepared_fp8=prepared_fp8)
         return self._forward_method(hidden_states)
 
     def _output_projection(
@@ -865,6 +868,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
+        if self._sm80_group32_prepare_input:
+            from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+                Group32FP8Input,
+            )
+            from vllm.model_executor.layers.quantization.utils.sm80_group32_norm import (  # noqa: E501
+                gated_norm_fp8,
+            )
+
+            prepared = gated_norm_fp8(
+                core_attn_out, z, self.norm.weight, self.norm.eps, self.norm.activation
+            )
+            rows = z_shape_og[0]
+            output, _ = self.out_proj(
+                Group32FP8Input(
+                    prepared.codes.reshape(rows, -1), prepared.scales.reshape(rows, -1)
+                )
+            )
+            return output
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
@@ -910,6 +931,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
+        prepared_fp8=None,
     ) -> torch.Tensor:
         """
         Forward pass with three parts:
@@ -922,13 +944,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         if self._sm80_group32_prepare_input:
-            from vllm.model_executor.layers.quantization.utils.sm80_group32_qdq import (
-                group32_fp8_qdq_fused,
+            from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+                quantize_input,
             )
 
-            hidden_states = group32_fp8_qdq_fused(hidden_states)
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+            projection_input = (
+                prepared_fp8
+                if prepared_fp8 is not None
+                else quantize_input(hidden_states)
+            )
+        else:
+            projection_input = hidden_states
+        mixed_qkvz, _ = self.in_proj_qkvz(projection_input)
+        ba, _ = self.in_proj_ba(projection_input)
 
         use_fused_gdn_decode = (
             self.enable_fused_gdn_decode
@@ -941,13 +969,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
-                mixed_qkvz,
-                ba,
-                core_attn_out,
-                layer_name=_encode_layer_name(self.prefix),
-            )
-            output, _ = self.out_proj(core_attn_out.flatten(-2))
+            if self._sm80_group32_prepare_input:
+                from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (  # noqa: E501
+                    Group32FP8Input,
+                )
+
+                codes, scales = (
+                    torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed_fp8(
+                        mixed_qkvz,
+                        ba,
+                        core_attn_out,
+                        layer_name=_encode_layer_name(self.prefix),
+                    )
+                )
+                projection_input = Group32FP8Input(codes, scales)
+            else:
+                torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed(
+                    mixed_qkvz,
+                    ba,
+                    core_attn_out,
+                    layer_name=_encode_layer_name(self.prefix),
+                )
+                projection_input = core_attn_out.flatten(-2)
+            output, _ = self.out_proj(projection_input)
             return output
 
         if self.gqa_interleaved_layout:
@@ -1829,7 +1873,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkvz: torch.Tensor,
         ba: torch.Tensor,
         core_attn_out: torch.Tensor,
-    ) -> None:
+        emit_fp8: bool = False,
+    ):
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
@@ -1838,6 +1883,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
             self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
+            if emit_fp8:
+                from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (  # noqa: E501
+                    quantize_input,
+                )
+
+                return quantize_input(core_attn_out.flatten(-2))
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -1848,12 +1899,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output_gate_flat.size(0), -1, self.head_v_dim
         )
         b, a = self.split_ba(ba)
-        self._forward_core_fused_norm(
+        return self._forward_core_fused_norm(
             mixed_qkv=mixed_qkv,
             b=b,
             a=a,
             output_gate=output_gate,
             core_attn_out=core_attn_out,
+            emit_fp8=emit_fp8,
         )
 
     def _can_use_fused_gdn_mtp_decode(
@@ -1914,7 +1966,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         a: torch.Tensor,
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
-    ) -> None:
+        emit_fp8: bool = False,
+    ):
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
         attn_metadata = None
@@ -1922,6 +1975,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
             self._warmup_prefill_kernels(mixed_qkv, 0)
+            if emit_fp8:
+                from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (  # noqa: E501
+                    quantize_input,
+                )
+
+                return quantize_input(core_attn_out.flatten(-2))
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -1937,6 +1996,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
             )
+            if emit_fp8:
+                from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (  # noqa: E501
+                    quantize_input,
+                )
+
+                return quantize_input(core_attn_out.flatten(-2))
             return
         self._forward_core(
             mixed_qkv=mixed_qkv,
@@ -1945,6 +2010,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
         num_actual_tokens = attn_metadata.num_actual_tokens
+        if emit_fp8:
+            from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+                Group32FP8Input,
+            )
+            from vllm.model_executor.layers.quantization.utils.sm80_group32_norm import (  # noqa: E501
+                gated_norm_fp8,
+            )
+
+            rows, heads, width = core_attn_out.shape
+            prepared = gated_norm_fp8(
+                core_attn_out.reshape(-1, width),
+                output_gate.reshape(-1, width),
+                self.norm.weight,
+                self.norm.eps,
+                self.norm.activation,
+                valid_rows=num_actual_tokens * heads,
+            )
+            return Group32FP8Input(
+                prepared.codes.reshape(rows, heads * width),
+                prepared.scales.reshape(rows, heads * width // 32),
+            )
         self._rms_norm_gated_cuda(
             core_attn_out[:num_actual_tokens],
             output_gate[:num_actual_tokens],
@@ -2044,6 +2130,49 @@ direct_register_custom_op(
     op_func=qwen_gdn_attention_core_fused_norm_packed,
     mutates_args=["core_attn_out"],
     fake_impl=gdn_attention_core_fused_norm_packed_fake,
+)
+
+
+@eager_break_during_capture
+def qwen_gdn_attention_core_fused_norm_packed_fp8(
+    mixed_qkvz: torch.Tensor,
+    ba: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
+    prepared = layer._forward_core_fused_norm_packed(
+        mixed_qkvz, ba, core_attn_out, emit_fp8=True
+    )
+    return prepared.codes, prepared.scales
+
+
+def gdn_attention_core_fused_norm_packed_fp8_fake(
+    mixed_qkvz: torch.Tensor,
+    ba: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, heads, width = core_attn_out.shape
+    return (
+        torch.empty(
+            (rows, heads * width),
+            device=core_attn_out.device,
+            dtype=torch.float8_e4m3fn,
+        ),
+        torch.empty(
+            (rows, heads * width // 32),
+            device=core_attn_out.device,
+            dtype=torch.float32,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen_gdn_attention_core_fused_norm_packed_fp8",
+    op_func=qwen_gdn_attention_core_fused_norm_packed_fp8,
+    mutates_args=["core_attn_out"],
+    fake_impl=gdn_attention_core_fused_norm_packed_fp8_fake,
 )
 
 

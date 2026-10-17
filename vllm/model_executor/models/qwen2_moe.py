@@ -126,9 +126,6 @@ class Qwen2MoeMLP(nn.Module):
                 isinstance(getattr(proj, "scheme", None), DenseGroup32Fused)
                 for proj in (self.gate_up_proj, self.down_proj)
             )
-            if self._sm80_group32_shared_fast:
-                self.gate_up_proj._sm80_group32_input_prepared = True
-                self.down_proj._sm80_group32_input_prepared = True
 
     def forward(self, x, prepared_input: torch.Tensor | None = None):
         # Small batches overlap shared work with routed experts. Keep their
@@ -136,19 +133,19 @@ class Qwen2MoeMLP(nn.Module):
         fuse_shared = self._sm80_group32_shared_fast and x.shape[0] > 256
         gate_up_input = x
         if self._sm80_group32_shared_fast:
-            from vllm.model_executor.layers.quantization.utils.sm80_group32_qdq import (
-                group32_fp8_qdq_fused,
-                silu_mul_group32_fp8_qdq_fused,
+            from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+                Group32FP8Input,
+                quantize_input,
             )
 
             gate_up_input = (
                 prepared_input
-                if fuse_shared and prepared_input is not None
-                else group32_fp8_qdq_fused(x)
+                if isinstance(prepared_input, Group32FP8Input)
+                else quantize_input(x)
             )
         gate_up, _ = self.gate_up_proj(gate_up_input)
         if fuse_shared:
-            out = silu_mul_group32_fp8_qdq_fused(gate_up)
+            out = quantize_input(gate_up, swiglu=True)
         elif self.use_group32_qdq_reference:
             from vllm.model_executor.layers.quantization.sm80_qdq_reference import (
                 training_swiglu,
@@ -156,7 +153,7 @@ class Qwen2MoeMLP(nn.Module):
 
             out = training_swiglu(gate_up)
             if self._sm80_group32_shared_fast:
-                out = group32_fp8_qdq_fused(out)
+                out = quantize_input(out)
         else:
             out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)

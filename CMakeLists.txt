@@ -741,6 +741,16 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
                      " in CUDA target architectures")
     endif()
 
+  # FP8 activation + FP8 weight, FP32 G32 scales, BF16 output on SM80.
+  cuda_archs_loose_intersection(SM80_DENSE_FP8_ARCHS "8.0" "${CUDA_ARCHS}")
+  if (SM80_DENSE_FP8_ARCHS)
+    set(SM80_DENSE_FP8_SRC
+      "csrc/libtorch_stable/quantization/marlin/sm80_fp8/dense.cu")
+    set_gencode_flags_for_srcs(SRCS "${SM80_DENSE_FP8_SRC}"
+      CUDA_ARCHS "${SM80_DENSE_FP8_ARCHS}")
+    list(APPEND VLLM_STABLE_EXT_SRC "${SM80_DENSE_FP8_SRC}")
+  endif()
+
   # DeepSeek V3 fused A GEMM kernel (requires SM 9.0+, Hopper and later)
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     cuda_archs_loose_intersection(DSV3_FUSED_A_GEMM_ARCHS "9.0a;10.0f;10.7f;11.0f;12.0f" "${CUDA_ARCHS}")

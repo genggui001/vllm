@@ -291,17 +291,33 @@ def test_fused_group32_graph_replays_new_values_and_router_order():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("leading", [(0,), (3,), (2, 5)])
-def test_group32_dense_fused_keeps_linear_shape_and_bias_bits(leading):
-    """The Dense wrapper preserves empty/batched shape and reference bias rounding."""
+def test_group32_dense_fp8_preserves_strided_and_empty_shapes(
+    leading, default_vllm_config
+):
+    """The FP8 core handles empty/batched inputs and cannot use BF16 Linear."""
     from vllm.model_executor.layers.quantization.sm80_group32 import DenseGroup32Fused
 
-    x = torch.randn(*leading, 128, device="cuda", dtype=torch.bfloat16)[..., ::2]
-    weight = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn(128, device="cuda", dtype=torch.bfloat16)
-    expected = F.linear(group32_fp8_qdq(x), weight, bias)
-    actual = DenseGroup32Fused().apply_weights(SimpleNamespace(weight=weight), x, bias)
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("SM80 kernel")
+    x = torch.randn(*leading, 256, device="cuda", dtype=torch.bfloat16)[..., ::2]
+    layer, reference_weight = _make_dense_fp8_test_layer(128, 128)
+    scheme = DenseGroup32Fused()
+    scheme.process_weights_after_loading(layer)
+    expected = F.linear(group32_fp8_qdq(x), reference_weight)
+    actual = scheme.apply_weights(layer, x)
     assert actual.shape == (*leading, 128)
-    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    assert layer.weight.dtype == torch.int32
+    assert layer.weight_scale.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
+
+
+def _make_dense_fp8_test_layer(n, k):
+    layer = torch.nn.Module()
+    codes = (torch.randn(n, k, device="cuda") * 16).to(torch.float8_e4m3fn)
+    scales = torch.rand(n, k // 32, device="cuda") * 0.002 + 0.001
+    layer.weight = torch.nn.Parameter(codes, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    return layer, dequant_fp8_group32(codes, scales)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -489,29 +505,74 @@ def test_group32_residual_norm_matches_native_shape_dependent_rounding(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("rows", [0, 1, 17, 257])
-def test_group32_prepared_dense_preserves_both_gdn_projection_bits(rows):
-    """Sharing input QDQ must neither omit it nor apply a second quantization."""
-    from types import SimpleNamespace
-
+def test_group32_prepared_dense_fp8_reuses_codes_without_requantization(
+    rows, default_vllm_config
+):
+    """Both GDN consumers receive identical prepared FP8 bytes and FP32 scales."""
     from vllm.model_executor.layers.quantization.sm80_group32 import DenseGroup32Fused
-    from vllm.model_executor.layers.quantization.utils.sm80_group32_qdq import (
-        group32_fp8_qdq_fused,
+    from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+        quantize_input,
     )
 
+    if torch.cuda.get_device_capability() != (8, 0):
+        pytest.skip("SM80 kernel")
     torch.manual_seed(20260930)
     x = torch.randn(rows, 4096, device="cuda", dtype=torch.bfloat16)[:, ::2]
-    prepared = group32_fp8_qdq_fused(x)
-    scheme = DenseGroup32Fused()
+    prepared = quantize_input(x)
     for width in (32, 6144):
-        weight = torch.randn(width, 2048, device="cuda", dtype=torch.bfloat16)
-        bias = torch.randn(width, device="cuda", dtype=torch.bfloat16)
-        layer = SimpleNamespace(weight=weight, _sm80_group32_input_prepared=True)
-        expected = torch.nn.functional.linear(group32_fp8_qdq(x), weight, bias)
-        actual = scheme.apply_weights(layer, prepared, bias)
-        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
-        layer._sm80_group32_input_prepared = False
-        separate = scheme.apply_weights(layer, x, bias)
-        assert torch.equal(separate.view(torch.int16), expected.view(torch.int16))
+        layer, reference_weight = _make_dense_fp8_test_layer(width, 2048)
+        scheme = DenseGroup32Fused()
+        scheme.process_weights_after_loading(layer)
+        expected = F.linear(group32_fp8_qdq(x), reference_weight)
+        actual = scheme.apply_weights(layer, prepared)
+        separate = scheme.apply_weights(layer, x)
+        assert torch.equal(actual.view(torch.int16), separate.view(torch.int16))
+        # Split reduction is not required to reproduce cuBLAS's accumulation tree.
+        torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
+
+
+@pytest.mark.parametrize(
+    "n,k,m", [(0, 128, 1), (128, 64, 1), (128, 192, 1), (6144, 2048, 524280)]
+)
+def test_dense_fp8_unsupported_static_shapes_fail_without_rollback(n, k, m):
+    from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+        validate_dense_shape,
+    )
+
+    with pytest.raises(ValueError, match="BF16 rollback is disabled"):
+        validate_dense_shape(n, k, m)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_dense_fp8_encoding_preserves_all_finite_bf16_qdq_bits():
+    from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+        quantize_input,
+    )
+
+    raw = torch.arange(65536, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    x = raw[raw.isfinite()].reshape(-1, 32).cuda()
+    prepared = quantize_input(x)
+    actual = dequant_fp8_group32(prepared.codes, prepared.scales)
+    expected = group32_fp8_qdq(x)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [0, 1, 17, 257])
+def test_norm_fp8_outputs_keep_qdq_and_residual_bits(rows):
+    from vllm.model_executor.layers.quantization.utils.sm80_group32_norm import (
+        residual_norm_group32_qdq,
+    )
+
+    x = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    weight = torch.randn(2048, device="cuda", dtype=torch.bfloat16) * 0.02
+    old = residual_norm_group32_qdq(x, residual, weight, 1e-6)
+    new = residual_norm_group32_qdq(x, residual, weight, 1e-6, emit_fp8=True)
+    for a, b in zip(old, new[:3]):
+        assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+    decoded = dequant_fp8_group32(new[3].codes, new[3].scales)
+    assert torch.equal(decoded.view(torch.int16), old[1].view(torch.int16))
 
 
 @pytest.fixture
@@ -1135,11 +1196,14 @@ def test_group32_native_marlin_rejects_backend_that_changes_activation_contract(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("rows", [0, 1, 17, 256, 257, 2048])
 @pytest.mark.parametrize("prepared", [False, True])
-def test_shared_group32_mlp_preserves_gate_and_projection_bits(
+def test_shared_group32_mlp_preserves_gate_and_prepared_fp8(
     default_vllm_config, monkeypatch, rows, prepared
 ):
-    """Shared gate reads unquantized x; fused MLP preserves both BF16 roundings."""
+    """Prepared FP8 and raw inputs agree; the shared gate still reads raw BF16."""
     from vllm.model_executor.layers.quantization.sm80_group32 import DenseGroup32Fused
+    from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+        quantize_input,
+    )
     from vllm.model_executor.models import qwen2_moe
 
     class Projection(torch.nn.Module):
@@ -1148,14 +1212,12 @@ def test_shared_group32_mlp_preserves_gate_and_projection_bits(
             output_size = (
                 sum(output_size) if isinstance(output_size, list) else output_size
             )
-            self.weight = torch.nn.Parameter(
-                torch.randn(
-                    output_size, input_size, device="cuda", dtype=torch.bfloat16
-                )
-                / 32,
-                requires_grad=False,
-            )
+            layer, reference = _make_dense_fp8_test_layer(output_size, input_size)
+            self.weight = layer.weight
+            self.weight_scale = layer.weight_scale
+            self.register_buffer("reference_weight", reference)
             self.scheme = DenseGroup32Fused()
+            self.scheme.process_weights_after_loading(self)
 
         def forward(self, x):
             return self.scheme.apply_weights(self, x), None
@@ -1182,17 +1244,17 @@ def test_shared_group32_mlp_preserves_gate_and_projection_bits(
     if rows:
         x[0, :32] = -0.0
         x[0, 32:64] *= torch.finfo(torch.bfloat16).tiny
-    xq = group32_fp8_qdq(x)
-    expected = F.linear(
-        group32_fp8_qdq(training_swiglu(F.linear(xq, mlp.gate_up_proj.weight))),
-        mlp.down_proj.weight,
-    ) * F.sigmoid(F.linear(x, gate.weight))
-    actual = mlp(x, prepared_input=xq if prepared else None)
+    # Use the same GEMM for both paths: this test isolates fusion semantics
+    # from the GEMM's documented accumulation error against BF16 cuBLAS.
+    gate_up = mlp.gate_up_proj(quantize_input(x))[0]
+    expected = mlp.down_proj(quantize_input(training_swiglu(gate_up)))[0]
+    expected = expected * F.sigmoid(F.linear(x, gate.weight))
+    actual = mlp(x, prepared_input=quantize_input(x) if prepared else None)
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
     # The same instance must also support a later call without a prepared tensor.
     if prepared:
-        actual = mlp(x)
-        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        separate = mlp(x)
+        assert torch.equal(actual.view(torch.int16), separate.view(torch.int16))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1287,4 +1349,60 @@ def test_group32_masked_combine_graph_refreshes_invalid_routes():
         x[~valid] = float("nan")
         ops.moe_sum(x, expected, torch.where(valid, ids, -1))
         graph.replay()
+        assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_dense_fp8_rejects_bias_and_invalid_scales_during_loading(default_vllm_config):
+    """Invalid static Dense contracts fail before the first forward call."""
+    from vllm.model_executor.layers.quantization.sm80_group32 import DenseGroup32Fused
+
+    layer, _ = _make_dense_fp8_test_layer(128, 128)
+    layer.bias = torch.nn.Parameter(torch.zeros(128, device="cuda"))
+    with pytest.raises(ValueError, match="bias-free"):
+        DenseGroup32Fused().process_weights_after_loading(layer)
+    layer.bias = None
+    layer.weight_scale.data[0, 0] = 0
+    with pytest.raises(ValueError, match="positive finite"):
+        DenseGroup32Fused().process_weights_after_loading(layer)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("shape", [(8, 6144, 2048), (1024, 1024, 4096)])
+def test_dense_fp8_graph_refresh_and_concurrent_workspaces(shape, default_vllm_config):
+    """Split partials/locks are private to each call and read fresh FP8 inputs."""
+    from vllm.model_executor.layers.quantization.sm80_group32 import DenseGroup32Fused
+    from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+        quantize_input,
+    )
+
+    m, n, k = shape
+    layer, _ = _make_dense_fp8_test_layer(n, k)
+    method = DenseGroup32Fused()
+    method.process_weights_after_loading(layer)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    prepared = quantize_input(x)
+    expected = method.apply_weights(layer, prepared)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = method.apply_weights(layer, prepared)
+    for _ in range(3):
+        new = quantize_input(torch.randn_like(x))
+        prepared.codes.copy_(new.codes)
+        prepared.scales.copy_(new.scales)
+        expected = method.apply_weights(layer, prepared)
+        graph.replay()
+        assert torch.equal(captured.view(torch.int16), expected.view(torch.int16))
+    inputs = [quantize_input(torch.randn_like(x)) for _ in range(2)]
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    outputs = []
+    for stream, value in zip(streams, inputs):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            outputs.append(method.apply_weights(layer, value))
+    for stream in streams:
+        torch.cuda.current_stream().wait_stream(stream)
+    for value, output in zip(inputs, outputs):
+        expected = method.apply_weights(layer, value)
         assert torch.equal(output.view(torch.int16), expected.view(torch.int16))

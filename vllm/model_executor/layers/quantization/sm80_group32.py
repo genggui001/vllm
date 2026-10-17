@@ -6,7 +6,6 @@ from functools import partial
 from typing import cast
 
 import torch
-import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -27,12 +26,16 @@ from vllm.model_executor.layers.quantization.sm80_qdq_reference import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_moe_permute_scales,
 )
+from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+    Group32FP8Input,
+    dense_fp8,
+    prepare_weight,
+    quantize_input,
+    validate_dense_shape,
+)
 from vllm.model_executor.layers.quantization.utils.sm80_group32_config import (
     has_static_fp8_qkv,
     is_group32_export,
-)
-from vllm.model_executor.layers.quantization.utils.sm80_group32_qdq import (
-    group32_fp8_qdq_fused,
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -129,17 +132,46 @@ class SM80Group32Config(SM80QDQReferenceConfig):
 
 
 class DenseGroup32Fused(DenseGroup32QDQReference):
+    """Load-time validated FP8-only Dense backend; dispatch lives in CUDA."""
+
+    def process_weights_after_loading(self, layer):
+        from vllm.config import get_current_vllm_config
+
+        if getattr(layer, "bias", None) is not None:
+            raise ValueError(
+                "SM80 Dense FP8 currently requires bias-free Linear layers"
+            )
+        config = get_current_vllm_config()
+        self.n, self.k = layer.weight.shape
+        max_tokens = max(
+            config.scheduler_config.max_num_batched_tokens,
+            config.scheduler_config.max_num_seqs,
+            config.compilation_config.max_cudagraph_capture_size or 0,
+        )
+        validate_dense_shape(self.n, self.k, max_tokens)
+        weight, scale, auxiliary = prepare_weight(layer.weight, layer.weight_scale)
+        for name, value in (
+            ("weight", weight),
+            ("weight_scale", scale),
+            ("weight_auxiliary", auxiliary),
+        ):
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
+
     def apply_weights(self, layer, x, bias=None):
-        shape = x.shape
-        flat = x.reshape(-1, shape[-1])
-        xq = (
-            flat
-            if getattr(layer, "_sm80_group32_input_prepared", False)
-            else group32_fp8_qdq_fused(flat)
+        if bias is not None:
+            raise ValueError("Dense FP8 bias must be rejected during model loading")
+        if isinstance(x, Group32FP8Input):
+            shape = x.codes.shape
+            prepared = x
+        else:
+            shape = x.shape
+            prepared = quantize_input(x.reshape(-1, shape[-1]))
+        out = dense_fp8(
+            prepared, layer.weight, layer.weight_scale, layer.weight_auxiliary, self.n
         )
-        return F.linear(xq, layer.weight, bias).reshape(
-            *shape[:-1], layer.weight.shape[0]
-        )
+        return out.reshape(*shape[:-1], self.n)
 
 
 def _load_group32_expert_weight(

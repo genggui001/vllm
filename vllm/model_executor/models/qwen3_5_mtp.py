@@ -105,6 +105,18 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
+        self._sm80_dense_fp8 = False
+        if quant_config is not None and quant_config.get_name() == "sm80_group32":
+            from vllm.model_executor.layers.quantization.sm80_group32 import (
+                DenseGroup32Fused,
+            )
+
+            self._sm80_dense_fp8 = isinstance(
+                getattr(self.fc, "scheme", None), DenseGroup32Fused
+            )
+            if self._sm80_dense_fp8 and config.hidden_size not in (256, 2048):
+                raise ValueError("SM80 FP8 MTP Norm requires hidden size 256/2048")
+
         # GPTQ: quantized checkpoints may exclude MTP from quantization via
         # quantization_config.dynamic with "-:pattern" entries. When detected,
         # disable quantization for MTP layers so they use unquantized params.
@@ -156,10 +168,23 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states)
-            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
-            hidden_states = self.fc(hidden_states)
+            if self._sm80_dense_fp8:
+                from vllm.model_executor.layers.quantization.utils.sm80_group32_norm import (  # noqa: E501
+                    norm_concat_fp8,
+                )
+
+                fc_input = norm_concat_fp8(
+                    inputs_embeds,
+                    hidden_states,
+                    self.pre_fc_norm_embedding.weight,
+                    self.pre_fc_norm_hidden.weight,
+                    self.pre_fc_norm_hidden.variance_epsilon,
+                )
+            else:
+                inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states)
+                fc_input = torch.cat([inputs_embeds, hidden_states], dim=-1)
+            hidden_states = self.fc(fc_input)
             residual = None
         else:
             assert intermediate_tensors is not None

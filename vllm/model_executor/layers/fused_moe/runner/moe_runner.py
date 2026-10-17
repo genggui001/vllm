@@ -213,6 +213,60 @@ direct_register_custom_op(
 )
 
 
+def _moe_forward_shared_fp8(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+    fp8_codes: torch.Tensor,
+    fp8_scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+        Group32FP8Input,
+    )
+
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    return layer._forward_impl(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        shared_fp8=Group32FP8Input(fp8_codes, fp8_scales),
+    )
+
+
+def _moe_forward_shared_fp8_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    hidden_dim_unpadded: int,
+    fp8_codes: torch.Tensor,
+    fp8_scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _moe_forward_shared_fake(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        layer_name,
+        hidden_dim_unpadded,
+    )
+
+
+# Isolated schema keeps all existing MoE callers and backends unchanged.
+# FP8 tensors are explicit inputs, with normal graph and stream lifetimes.
+direct_register_custom_op(
+    op_name="moe_forward_shared_fp8",
+    op_func=_moe_forward_shared_fp8,
+    fake_impl=_moe_forward_shared_fp8_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def _unpack(
     result: torch.Tensor
     | UnfinalizedMoEOutput
@@ -605,6 +659,7 @@ class MoERunner(MoERunnerInterface):
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
         shared_experts_overlapping: bool = False,
+        shared_fp8=None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -619,9 +674,7 @@ class MoERunner(MoERunnerInterface):
         self._maybe_apply_shared_experts(
             shared_experts_input,
             SharedExpertsOrder.NO_OVERLAP,
-            hidden_states
-            if getattr(self.routed_experts, "_sm80_group32_prepared", False)
-            else None,
+            shared_fp8,
         )
 
         if self.routed_experts.quant_method.is_monolithic:
@@ -694,6 +747,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
+        prepared_shared_fp8=None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -738,7 +792,7 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
+        entry_args = (
             hidden_states,
             router_logits,
             shared_experts_input,
@@ -748,6 +802,12 @@ class MoERunner(MoERunnerInterface):
             if self._quant_method.has_unpadded_output
             else 0,
         )
+        if prepared_shared_fp8 is not None and self._shared_experts is not None:
+            result = torch.ops.vllm.moe_forward_shared_fp8(
+                *entry_args, prepared_shared_fp8.codes, prepared_shared_fp8.scales
+            )
+        else:
+            result = self._forward_entry(*entry_args)
 
         #
         # Note: there are two all-reduce points below. They are mutually
@@ -875,6 +935,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        shared_fp8=None,
     ) -> (
         torch.Tensor
         | UnfinalizedMoEOutput
@@ -902,9 +963,7 @@ class MoERunner(MoERunnerInterface):
         if self._shared_experts is not None:
             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
                 shared_experts_input,
-                hidden_states
-                if getattr(self.routed_experts, "_sm80_group32_prepared", False)
-                else None,
+                shared_fp8,
             )
 
         # If the Runner holds the gate, apply it after the stream sync,
@@ -937,6 +996,7 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
                 shared_experts_overlapping=shared_experts_overlapping,
+                shared_fp8=shared_fp8,
             )
 
             return self._maybe_combine(
