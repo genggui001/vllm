@@ -1,5 +1,19 @@
 # v20.1 group32：正式源码版
 
+## r6 多模态接入
+
+视觉塔及视觉投影使用原生 BF16，不接收语言侧的量化配置。
+语言侧保留 r6 Dense FP8 核心、group32 MoE 和 checkpoint 中保存的 QKV scales。
+视觉 attention 按 `mm_encoder_attn_backend` 独立选择，语言侧自动选择
+SM80 FP8 KV attention。不能为这个部署设置 `--mm-encoder-attn-dtype fp8`。
+
+图文输入不需要 `--language-model-only`；需要纯文本时仍可显式设置该参数。
+`serve_group32.sh` 默认支持图文和 MTP3，`MTP_TOKENS=0` 可关闭 MTP。
+异步调度使用 vLLM 的自动选择，不额外强制关闭。
+MTP 与异步调度同时启用时，vLLM 会自动关闭 cascade attention。
+
+## 2026-10-14 历史发布记录
+
 2026-10-14：将已完成 126 项评测的 native-prepared group32 Marlin 实现
 整合到 `v0.29.0-sm80w4a8qkv8`。此次为源码分支发布，尚未为该提交重新
 编译或安装 wheel；旧 wheel 不会自动包含本次修改。
@@ -14,7 +28,8 @@ Qwen3.5 MoE、INT4 group32 专家权重、FP8 group32 Dense 权重、动态 grou
   QDQ 后以 BF16 输入原生 Marlin，保留 packed INT4 专家权重。
 * FC1 复用 residual RMSNorm 的 prepared QDQ 输出；FC2 前融合训练舍入的
   SwiGLU 与 group32 QDQ。路由概率由原生 Marlin 在 FC2 后乘，使用原生求和。
-* Dense 权重按保存的 FP32 group32 scale 反量化为 BF16；不将 scale 降精度。
+* 该历史版本的 Dense 权重按保存的 FP32 group32 scale 反量化为 BF16。
+  当前 r6 已使用独立 FP8 核心，保留 FP32 scales，不回退到 BF16 QDQ。
 * QKV 使用 checkpoint 保存的 FP32 scale；FP8 KV cache 对应真实 E4M3 存储。
 * 旧 group128/token-FP8 模型继续使用 `marlin_fp8_qdq_fused`；普通 W4A16
   保留原来的 Marlin 路径。新模型不能显式选旧后端来绕过 group32 QDQ。
@@ -35,7 +50,6 @@ CUDA_VISIBLE_DEVICES=0,1 vllm serve "$MODEL" \
     --max-num-seqs 256 \
     --max-num-batched-tokens 8192 \
     --enable-chunked-prefill \
-    --language-model-only \
     --trust-remote-code
 ```
 

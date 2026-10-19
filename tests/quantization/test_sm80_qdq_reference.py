@@ -368,7 +368,7 @@ def test_group32_packed_moe_graph_refreshes_routing_and_ignores_invalid_slots(
 def test_group32_graph_capability_keeps_reference_eager_guard(
     monkeypatch, language_model_only
 ):
-    """Graph support must not imply support for unvalidated multimodal inputs."""
+    """Text and multimodal Graph execution retain the reference eager guard."""
     from vllm.config.multimodal import MultiModalConfig
     from vllm.model_executor.layers.quantization import sm80_qdq_reference as ref
     from vllm.model_executor.layers.quantization.sm80_group32 import SM80Group32Config
@@ -400,13 +400,14 @@ def test_group32_graph_capability_keeps_reference_eager_guard(
     packed = object.__new__(SM80Group32Config)
     with pytest.raises(ValueError, match="enforce-eager"):
         reference._check_runtime()
-    if language_model_only is False:
-        with pytest.raises(ValueError, match="--language-model-only"):
-            packed._check_runtime()
-    else:
-        packed._check_runtime()
+    packed._check_runtime()
     config.model_config.enforce_eager = True
     reference._check_runtime()
+    config.model_config.multimodal_config = MultiModalConfig(
+        mm_encoder_attn_dtype="fp8"
+    )
+    with pytest.raises(ValueError, match="unquantized BF16 vision encoder"):
+        packed._check_runtime()
     config.model_config.multimodal_config = None
     config.parallel_config.enable_expert_parallel = True
     with pytest.raises(ValueError, match="not EP"):

@@ -83,10 +83,14 @@ class SM80Group32Config(SM80QDQReferenceConfig):
     def _check_attention_runtime(self, config) -> None:
         model_config = getattr(config, "model_config", None)
         mm_config = getattr(model_config, "multimodal_config", None)
-        if mm_config is not None and not mm_config.language_model_only:
+        if (
+            mm_config is not None
+            and not mm_config.language_model_only
+            and mm_config.mm_encoder_attn_dtype is not None
+        ):
             raise ValueError(
-                "sm80_group32 currently supports text-only inference; "
-                "set --language-model-only to disable multimodal inputs."
+                "sm80_group32 requires an unquantized BF16 vision encoder; "
+                "omit --mm-encoder-attn-dtype."
             )
         backend = config.attention_config.backend
         per_kind = getattr(config.attention_config, "backend_per_kind", None)

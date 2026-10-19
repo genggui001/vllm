@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TP2 text-only deployment example; OMP is inherited.
+# TP2 BF16 vision + group32 language deployment; OMP is inherited.
 set -euo pipefail
 
 : "${MODEL:?Set MODEL to the original v20.1 group32 checkpoint directory}"
@@ -25,9 +25,9 @@ cmd=("${VLLM_BIN:-vllm}" serve "$MODEL"
     --max-model-len "${MAX_MODEL_LEN:-262144}"
     --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.8}"
     --max-num-seqs "${MAX_NUM_SEQS:-256}"
+    --max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE:-512}"
     --enable-chunked-prefill
     --enable-prefix-caching
-    --language-model-only
     --trust-remote-code
     --enable-auto-tool-choice
     --tool-call-parser qwen3_coder
@@ -40,7 +40,7 @@ cmd=("${VLLM_BIN:-vllm}" serve "$MODEL"
 if [[ -n ${MAX_NUM_BATCHED_TOKENS:-} ]]; then
     cmd+=(--max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS")
 fi
-case "${MTP_TOKENS:-0}" in
+case "${MTP_TOKENS:-3}" in
     0) ;;
     1|3)
         cmd+=(--speculative-config
@@ -48,10 +48,16 @@ case "${MTP_TOKENS:-0}" in
         ;;
     *) echo "MTP_TOKENS must be 0, 1, or 3." >&2; exit 2 ;;
 esac
-case "${CASCADE_ATTN:-0}" in
-    0) ;;
+case "${CASCADE_ATTN:-auto}" in
+    auto) ;;
+    0) cmd+=(--disable-cascade-attn) ;;
     1) cmd+=(--no-disable-cascade-attn) ;;
-    *) echo "CASCADE_ATTN must be 0 or 1." >&2; exit 2 ;;
+    *) echo "CASCADE_ATTN must be auto, 0, or 1." >&2; exit 2 ;;
+esac
+case "${LANGUAGE_MODEL_ONLY:-0}" in
+    0) ;;
+    1) cmd+=(--language-model-only) ;;
+    *) echo "LANGUAGE_MODEL_ONLY must be 0 or 1." >&2; exit 2 ;;
 esac
 
 if [[ ${1:-} == --print-argv ]]; then

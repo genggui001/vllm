@@ -746,6 +746,11 @@ class Qwen3_5MoeForConditionalGeneration(
         nn.Module.__init__(self)
         config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        vision_quant_config = (
+            None
+            if quant_config is not None and quant_config.get_name() == "sm80_group32"
+            else quant_config
+        )
         multimodal_config = vllm_config.model_config.multimodal_config
 
         self.config = config
@@ -772,7 +777,7 @@ class Qwen3_5MoeForConditionalGeneration(
             self.visual = Qwen3_VisionTransformer(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
+                quant_config=vision_quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
             )
 
