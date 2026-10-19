@@ -974,13 +974,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     Group32FP8Input,
                 )
 
-                codes, scales = (
-                    torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed_fp8(
-                        mixed_qkvz,
-                        ba,
-                        core_attn_out,
-                        layer_name=_encode_layer_name(self.prefix),
-                    )
+                width = self.value_dim // self.tp_size
+                codes = torch.empty(
+                    (num_tokens, width),
+                    device=hidden_states.device,
+                    dtype=torch.float8_e4m3fn,
+                )
+                scales = torch.empty(
+                    (num_tokens, width // 32),
+                    device=hidden_states.device,
+                    dtype=torch.float32,
+                )
+                torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed_fp8(
+                    mixed_qkvz,
+                    ba,
+                    core_attn_out,
+                    codes,
+                    scales,
+                    layer_name=_encode_layer_name(self.prefix),
                 )
                 projection_input = Group32FP8Input(codes, scales)
             else:
@@ -2138,40 +2149,34 @@ def qwen_gdn_attention_core_fused_norm_packed_fp8(
     mixed_qkvz: torch.Tensor,
     ba: torch.Tensor,
     core_attn_out: torch.Tensor,
+    codes_out: torch.Tensor,
+    scales_out: torch.Tensor,
     layer_name: LayerNameType,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> None:
     layer = get_forward_context().no_compile_layers[_resolve_layer_name(layer_name)]
     prepared = layer._forward_core_fused_norm_packed(
         mixed_qkvz, ba, core_attn_out, emit_fp8=True
     )
-    return prepared.codes, prepared.scales
+    # Eager breaks must update the addresses used by downstream graph segments.
+    codes_out.copy_(prepared.codes)
+    scales_out.copy_(prepared.scales)
 
 
 def gdn_attention_core_fused_norm_packed_fp8_fake(
     mixed_qkvz: torch.Tensor,
     ba: torch.Tensor,
     core_attn_out: torch.Tensor,
+    codes_out: torch.Tensor,
+    scales_out: torch.Tensor,
     layer_name: LayerNameType,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    rows, heads, width = core_attn_out.shape
-    return (
-        torch.empty(
-            (rows, heads * width),
-            device=core_attn_out.device,
-            dtype=torch.float8_e4m3fn,
-        ),
-        torch.empty(
-            (rows, heads * width // 32),
-            device=core_attn_out.device,
-            dtype=torch.float32,
-        ),
-    )
+) -> None:
+    return
 
 
 direct_register_custom_op(
     op_name="qwen_gdn_attention_core_fused_norm_packed_fp8",
     op_func=qwen_gdn_attention_core_fused_norm_packed_fp8,
-    mutates_args=["core_attn_out"],
+    mutates_args=["core_attn_out", "codes_out", "scales_out"],
     fake_impl=gdn_attention_core_fused_norm_packed_fp8_fake,
 )
 

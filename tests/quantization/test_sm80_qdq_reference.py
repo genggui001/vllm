@@ -1420,3 +1420,51 @@ def test_dense_fp8_graph_refresh_and_concurrent_workspaces(shape, default_vllm_c
     for value, output in zip(inputs, outputs):
         expected = method.apply_weights(layer, value)
         assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gdn_fp8_eager_break_refreshes_downstream_graph_inputs(monkeypatch):
+    """Fresh GDN codes/scales must reach later segments on every replay."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
+    from vllm.model_executor.layers.quantization.utils.sm80_dense_fp8 import (
+        quantize_input,
+    )
+
+    def core(mixed, ba, out, emit_fp8):
+        return quantize_input(mixed)
+
+    monkeypatch.setattr(
+        gdn,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            no_compile_layers={
+                "probe": SimpleNamespace(_forward_core_fused_norm_packed=core)
+            }
+        ),
+    )
+    x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+    ba = torch.zeros(16, 2, device="cuda", dtype=torch.bfloat16)
+    attn_out = torch.zeros(16, 1, 128, device="cuda", dtype=torch.bfloat16)
+    codes = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scales = torch.empty(16, 4, device="cuda", dtype=torch.float32)
+    op = torch.ops.vllm.qwen_gdn_attention_core_fused_norm_packed_fp8
+    for _ in range(3):
+        op(x, ba, attn_out, codes, scales, "probe")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        graph = BreakableCUDAGraphCapture()
+        with graph:
+            staged = x + 0
+            op(staged, ba, attn_out, codes, scales, "probe")
+            copied_codes = codes.view(torch.uint8).clone()
+            copied_scales = scales.clone()
+        assert graph.num_eager_breaks == 1
+        for scale in (0.5, 2.0, 4.0):
+            x.copy_(torch.randn_like(x) * scale)
+            graph.replay()
+            expected = quantize_input(x)
+            assert torch.equal(copied_codes, expected.codes.view(torch.uint8))
+            assert torch.equal(copied_scales, expected.scales)
+    torch.cuda.current_stream().wait_stream(stream)

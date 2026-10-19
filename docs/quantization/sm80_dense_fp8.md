@@ -88,3 +88,67 @@ The JSON preserves raw timing samples, chronology and numerical errors.
 The kernel families derive from the retained standalone Marlin experiments;
 original template bodies are retained. The integration evidence manifest
 records their source hashes and the mapping of selected shapes to profiles.
+
+## Validated r6 release
+
+The r6 release includes the Dense FP8 shape dispatch and fused producers,
+small-M decode tuning, and a GDN CUDA Graph boundary fix. The GDN eager break
+writes codes and scales into caller-owned output buffers and declares those
+mutations. Later graph segments therefore consume refreshed values at the
+captured addresses. A regression test changes inputs between graph replays.
+Dense stays on the FP8 path; sampling and generation constraints are unchanged.
+
+### Model evaluation
+
+The v20.1 group32 best checkpoint was evaluated on 42 MedBench datasets in
+each of base, r and enr modes: 31,989 outputs per version. Dataset scores use
+their original metrics and are averaged equally; they are not a pooled
+per-question accuracy. The baseline is candidate `3b372a1c`, and the release
+runtime matches the evaluated `model-package-r6`.
+
+| Mode | Baseline | FP8 r6 | Change, points |
+| --- | --- | --- | --- |
+| base | 73.2262 | 73.1719 | -0.0543 |
+| r | 74.6926 | 75.4189 | +0.7262 |
+| enr | 75.2730 | 75.4986 | +0.2256 |
+| Equal mean | 74.3973 | 74.6964 | +0.2992 |
+
+This is a single-seed evaluation with the original prompts, per-request seeds
+and scoring. Three r6 outputs contain U+FFFD; one reaches the length cap.
+The two remaining cases occur inside the output: one in reasoning only and
+one in the final answer. These results do not imply zero generation anomalies.
+
+### Whole-model performance
+
+Measured on the same two A100-SXM4-80GB GPUs with TP2, BF16 model dtype,
+FP8 E4M3 KV cache, 40 GiB KV cache per GPU, max sequences 256, batched-token
+limit 8192, chunked prefill and CUDA Graph. Prefix caching, cascade, MTP and
+async scheduling are disabled. Both versions use Python 3.12, Torch 2.13 and
+CUDA 13.2. Four independent engines run baseline/candidate/candidate/baseline;
+each workload has two warmups and three measured runs per engine. Values are
+the median of six runs per version, with no observed GPU contention or
+request preemption.
+
+| Phase | Input tokens x batch | Baseline token/s | FP8 r6 token/s | Change |
+| --- | --- | --- | --- | --- |
+| Prefill | 128 x 1 | 3650.23 | 3525.00 | -3.43% |
+| Prefill | 512 x 4 | 19043.93 | 20161.42 | +5.87% |
+| Prefill | 1024 x 16 | 25480.56 | 24846.73 | -2.49% |
+| Prefill | 8192 x 1 | 29237.95 | 28061.65 | -4.02% |
+| Prefill | 32768 x 1 | 24595.98 | 23774.23 | -3.34% |
+| Decode | 1024 x 1 | 130.64 | 147.26 | +12.72% |
+| Decode | 1024 x 16 | 1382.73 | 1521.25 | +10.02% |
+| Decode | 1024 x 64 | 3375.31 | 3331.68 | -1.29% |
+| Decode | 1024 x 256 | 5861.24 | 5264.81 | -10.18% |
+| Decode | 8192 x 16 | 1051.02 | 1129.96 | +7.51% |
+
+Prefill counts input tokens through the last first-token response of the
+batch. Decode counts output tokens during pure, full-batch decode steps.
+Synthetic prompts are identical across versions; greedy generation ignores
+EOS and produces 16 or 128 tokens for prefill or decode workloads. These
+timing settings are separate from the unchanged quality-evaluation sampling.
+Loading, graph capture and warmup are excluded. The speed benefit depends
+on workload; batch 256 and long prefill remain slower than the baseline.
+
+Raw evaluation and speed manifests are retained as `full-eval-20261018-r3`
+and `full-model-speed-r6-20261019-r2`, including package hashes and raw samples.
