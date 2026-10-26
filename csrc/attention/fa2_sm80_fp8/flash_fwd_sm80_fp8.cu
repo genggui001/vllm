@@ -346,7 +346,44 @@ __global__ void group32_fp8_split(const Flash_fwd_sm80_fp8_params params) {
 }
 template <int LogSplits>
 __global__ void group32_combine(const Flash_fwd_sm80_fp8_params params) {
-  combine_attn_seqk_parallel<Sm80Fp8DecodeTraits, 4, LogSplits, true>(params);
+  auto combine = params;
+  if (!params.packed_decode_gqa) {
+    combine.o_ptr = params.split_padded_out;
+    combine.softmax_lse_ptr = params.split_padded_lse;
+    combine.o_batch_stride = params.h * params.seqlen_q * 256;
+    combine.o_head_stride = params.seqlen_q * 256;
+    combine.o_row_stride = 256;
+    combine.unpadded_lse = false;
+  }
+  combine_attn_seqk_parallel<Sm80Fp8DecodeTraits, 4, LogSplits, true>(combine);
+}
+
+__global__ void group32_unpad_split(const Flash_fwd_sm80_fp8_params params) {
+  constexpr int kVec = 8;
+  const int batch = blockIdx.x;
+  const int begin = params.cu_seqlens_q[batch];
+  const int length = params.cu_seqlens_q[batch + 1] - begin;
+  const auto* padded =
+      static_cast<const cutlass::bfloat16_t*>(params.split_padded_out);
+  auto* output = static_cast<cutlass::bfloat16_t*>(params.o_ptr);
+  for (int i = threadIdx.x; i < length * params.h * (256 / kVec);
+       i += blockDim.x) {
+    const int col = (i % (256 / kVec)) * kVec;
+    const int head = (i / (256 / kVec)) % params.h;
+    const int row = i / ((256 / kVec) * params.h);
+    const int64_t source =
+        ((int64_t(batch) * params.h + head) * params.seqlen_q + row) * 256;
+    const int64_t target = int64_t(begin + row) * params.o_row_stride +
+                           int64_t(head) * params.o_head_stride;
+    *reinterpret_cast<uint4*>(output + target + col) =
+        *reinterpret_cast<const uint4*>(padded + source + col);
+    if (col == 0 && params.return_softmax_lse) {
+      static_cast<float*>(
+          params
+              .softmax_lse_ptr)[int64_t(head) * params.total_q + begin + row] =
+          static_cast<const float*>(params.split_padded_lse)[source / 256];
+    }
+  }
 }
 void run_mha_fwd_sm80_fp8_split(Flash_fwd_sm80_fp8_params& params,
                                 cudaStream_t stream) {
@@ -381,5 +418,9 @@ void run_mha_fwd_sm80_fp8_split(Flash_fwd_sm80_fp8_params& params,
   else if (params.num_splits <= 128)
     group32_combine<7><<<grid, 128, 0, stream>>>(params);
   FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+  if (!params.packed_decode_gqa) {
+    group32_unpad_split<<<params.b, 128, 0, stream>>>(params);
+    FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 }  // namespace FLASH_NAMESPACE

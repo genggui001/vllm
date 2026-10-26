@@ -12,6 +12,8 @@ struct Flash_fwd_sm80_fp8_params : public Flash_fwd_params {
   const float* __restrict__ v_scale_ptr;
   bool packed_decode_gqa;
   bool return_softmax_lse;
+  void* split_padded_out;
+  void* split_padded_lse;
 };
 
 void run_mha_fwd_sm80_fp8_split(Flash_fwd_sm80_fp8_params& params,

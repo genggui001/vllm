@@ -260,9 +260,9 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
   const int kernel_seqlen_q = pack_decode_gqa ? q_head_groups : max_seqlen_q;
   int splits = 1;
   if (group32_decode) {
-    STD_TORCH_CHECK(pack_decode_gqa && q_head_groups <= 16 && !prequantized_q,
-                    "Group32 split-KV requires raw Q, one query per sequence, "
-                    "and 2..16 query heads per KV head");
+    STD_TORCH_CHECK(kernel_seqlen_q <= 16 && !prequantized_q,
+                    "Group32 split-KV requires raw Q and at most 16 logical "
+                    "query rows per sequence");
     STD_TORCH_CHECK(num_splits >= 0 && num_splits <= 128,
                     "Group32 num_splits must be in [0, 128]");
     splits = num_splits > 0
@@ -362,7 +362,22 @@ static std::vector<Tensor> mha_varlen_fwd_sm80_fp8_impl(
     params.oaccum_ptr = partial.data_ptr();
     params.softmax_lseaccum_ptr = partial_lse.data_ptr();
     params.seqlenq_ngroups_swapped = true;
-    run_mha_fwd_sm80_fp8_split(params, stream);
+    if (pack_decode_gqa) {
+      run_mha_fwd_sm80_fp8_split(params, stream);
+    } else {
+      // Native FA2 combines padded rows. Keep its FP32 reduction unchanged,
+      // then map only live rows back through device cu_seqlens_q. Those
+      // lengths can change between full-graph replays (including zero rows).
+      auto padded_out = torch::stable::new_empty(
+          q, {batch_size, kernel_num_heads, kernel_seqlen_q, head_size},
+          ScalarType::BFloat16);
+      auto padded_lse = torch::stable::new_empty(
+          q, {batch_size, kernel_num_heads, kernel_seqlen_q},
+          ScalarType::Float);
+      params.split_padded_out = padded_out.data_ptr();
+      params.split_padded_lse = padded_lse.data_ptr();
+      run_mha_fwd_sm80_fp8_split(params, stream);
+    }
   } else if (stage_prefill && stage_workspace != nullptr) {
     const int64_t q_bytes = int64_t(total_q) * num_heads * head_size * 2;
     const int64_t kv_bytes = int64_t(batch_size) * stage_pages *

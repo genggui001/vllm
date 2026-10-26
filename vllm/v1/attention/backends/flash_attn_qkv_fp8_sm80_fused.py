@@ -377,7 +377,11 @@ class FlashAttentionQkvFp8Sm80FusedImpl(FlashAttentionImpl):
         query = query[:num_actual_tokens]
         actual_output = output[:num_actual_tokens]
 
-        if packed_decode and getattr(layer, "_sm80_group32_decode", False):
+        if (
+            not attn_metadata.use_cascade
+            and attn_metadata.max_query_len <= 16
+            and getattr(layer, "_sm80_group32_decode", False)
+        ):
             if prequantized_q:
                 raise ValueError("Group32 split-KV requires an unquantized query")
             torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_group32(

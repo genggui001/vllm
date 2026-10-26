@@ -238,6 +238,24 @@ inline __device__ void compute_attn_sm80_fp8(
   const int bidb = blockIdx.y;
   const int bidh = blockIdx.z;
   const BlockInfo<true> binfo(params, bidb);
+  if constexpr (Split) {
+    if (!params.packed_decode_gqa) {
+      // The padded native combiner reads every logical row, even when a
+      // graph replay shrinks a request or leaves a dummy request empty.
+      const index_t first =
+          ((index_t(blockIdx.x) * params.b + bidb) * params.h + bidh) *
+          params.seqlen_q;
+      auto* partial = reinterpret_cast<float*>(params.oaccum_ptr);
+      for (int i = binfo.actual_seqlen_q * kHeadDim + tidx;
+           i < params.seqlen_q * kHeadDim; i += KernelTraits::kNThreads) {
+        partial[first * kHeadDim + i] = 0.0f;
+      }
+      if (tidx >= binfo.actual_seqlen_q && tidx < params.seqlen_q) {
+        reinterpret_cast<float*>(params.softmax_lseaccum_ptr)[first + tidx] =
+            -INFINITY;
+      }
+    }
+  }
   if (m_block * kBlockM >= binfo.actual_seqlen_q) {
     return;
   }

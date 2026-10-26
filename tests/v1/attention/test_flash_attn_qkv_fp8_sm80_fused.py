@@ -408,6 +408,58 @@ def test_cuda_op_matches_materialized_fa2_qdq(
         lse_bytes = sum(query_lens) * num_query_heads * 4
         workspace_limit = lse_bytes + 512
     assert temporary_bytes <= workspace_limit
+    if group32_decode and max(query_lens) > 1:
+        # Native varlen paged attention permits splits only for Q=1. Its
+        # kvcache entry supports short verification queries. Right-align
+        # each ragged Q segment to preserve the bottom-right causal mask.
+        padded_q = query.new_zeros(
+            (batch_size, max(query_lens), num_query_heads, head_size)
+        )
+        begin = 0
+        for batch, length in enumerate(query_lens):
+            if length:
+                padded_q[batch, -length:].copy_(query_reference[begin : begin + length])
+            begin += length
+        padded_out, padded_lse = torch.ops._vllm_fa2_C.fwd_kvcache(
+            padded_q,
+            key_reference,
+            value_reference,
+            None,
+            None,
+            kv_lens_tensor,
+            None,
+            None,
+            None,
+            None,
+            block_table,
+            None,
+            None,
+            softmax_scale,
+            causal,
+            -1,
+            -1,
+            0.0,
+            True,
+            num_splits,
+        )
+        reference = torch.cat(
+            [
+                padded_out[batch, -length:]
+                for batch, length in enumerate(query_lens)
+                if length
+            ]
+        )
+        reference_lse = torch.cat(
+            [
+                padded_lse[batch, :, -length:]
+                for batch, length in enumerate(query_lens)
+                if length
+            ],
+            dim=1,
+        )
+        assert torch.equal(output.view(torch.int16), reference.view(torch.int16))
+        torch.testing.assert_close(output_lse, reference_lse, rtol=1e-5, atol=1e-5)
+        return
     dummy_cu_k = torch.zeros_like(cu_query_lens)
     _, reference_lse, *_ = torch.ops._vllm_fa2_C.varlen_fwd(
         query_reference,
@@ -991,6 +1043,73 @@ def test_group32_decode_matches_native_automatic_split_bits(
 
 @pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
 @pytest.mark.parametrize("cache_padding", [-1, 8])
+@pytest.mark.parametrize("splits", [0, 1, 3, 32])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "query_lens,kv_lens",
+    [([4], [8193]), ([0, 4, 2, 16], [0, 1, 129, 513])],
+)
+def test_group32_speculative_queries_match_native_split_bits(
+    query_lens, kv_lens, causal, splits, cache_padding
+):
+    """MTP verification must retain causal masking and variable query layout."""
+    test_cuda_op_matches_materialized_fa2_qdq(
+        query_lens,
+        kv_lens,
+        causal,
+        cache_padding,
+        group32_decode=True,
+        num_splits=splits,
+        max_length_bound=16384,
+    )
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+def test_group32_speculative_graph_refreshes_variable_query_rows():
+    """Shrinking/reappearing requests must not read stale split scratch rows."""
+    args = _small_op_inputs((4, 4, 4), (129, 513, 257))
+    op = torch.ops._vllm_fa2_sm80_fp8_C.varlen_fwd_group32_lse
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            op(*args, 32)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result, lse = op(*args, 32)
+    reference = list(args)
+    reference[3] = torch.empty_like(args[3])
+    for lengths in [(4, 4, 4), (0, 2, 4), (1, 0, 1), (4, 3, 4)]:
+        args[0].normal_()
+        args[4].copy_(
+            torch.tensor(
+                [0, *torch.tensor(lengths).cumsum(0).tolist()],
+                dtype=torch.int32,
+                device="cuda",
+            )
+        )
+        args[5].copy_(torch.tensor([0, 19, 255], device="cuda", dtype=torch.int32))
+        args[6].copy_(args[6].roll(1, dims=1))
+        args[7].mul_(1.125)
+        result.fill_(13)
+        lse.fill_(12345)
+        expected, expected_lse = op(*reference, 32)
+        graph.replay()
+        live = sum(lengths)
+        assert torch.equal(
+            result[:live].view(torch.int16), expected[:live].view(torch.int16)
+        )
+        assert torch.equal(
+            lse[:, :live].view(torch.int32), expected_lse[:, :live].view(torch.int32)
+        )
+        assert not torch.isnan(result[:live]).any()
+        assert (result[live:] == 13).all()
+        assert (lse[:, live:] == 12345).all()
+
+
+@pytest.mark.skipif(not _is_sm80(), reason="An SM80 GPU is required")
+@pytest.mark.parametrize("cache_padding", [-1, 8])
 @pytest.mark.parametrize(
     ("query_lens", "kv_lens", "causal", "budget_mib"),
     [
@@ -1114,7 +1233,10 @@ def test_group32_prefill_workspace_reuse_preserves_results_and_graph(budget_delt
         ("PIECEWISE", False, True, 1, 8193, 8193, "group32"),
         ("FULL", True, True, 1, 8193, 8193, "group32"),
         ("FULL", False, False, 1, 8193, 8193, "original"),
-        ("FULL", False, True, 2, 8193, 8193, "original"),
+        ("FULL", False, True, 2, 8193, 16384, "group32"),
+        ("FULL", False, True, 4, 8193, 16384, "group32"),
+        ("NONE", False, True, 4, 8193, 8193, "group32"),
+        ("FULL", False, True, 17, 8193, 8193, "original"),
     ],
 )
 def test_group32_decode_keeps_capture_split_bound_in_eager_fallback(
